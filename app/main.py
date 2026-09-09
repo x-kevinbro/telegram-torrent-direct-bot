@@ -44,9 +44,20 @@ def db():
         progress REAL DEFAULT 0,
         save_path TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        chat_id INTEGER,
+        progress_message_id INTEGER,
+        last_progress_text TEXT
     )
     """)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    for column, ddl in {
+        "chat_id": "ALTER TABLE jobs ADD COLUMN chat_id INTEGER",
+        "progress_message_id": "ALTER TABLE jobs ADD COLUMN progress_message_id INTEGER",
+        "last_progress_text": "ALTER TABLE jobs ADD COLUMN last_progress_text TEXT",
+    }.items():
+        if column not in existing:
+            conn.execute(ddl)
     conn.commit()
     return conn
 
@@ -98,18 +109,51 @@ def active_count(user_id: int) -> int:
     return conn.execute("SELECT COUNT(*) c FROM jobs WHERE user_id=? AND status IN ('queued','downloading')", (user_id,)).fetchone()["c"]
 
 
-def make_job(user_id: int) -> tuple[int, str, Path]:
+def make_job(user_id: int, chat_id: int) -> tuple[int, str, Path]:
     token = secrets.token_urlsafe(18)
     now = int(time.time())
     save_path = DOWNLOAD_DIR / f"user_{user_id}" / token
     save_path.mkdir(parents=True, exist_ok=True)
     conn = db()
     cur = conn.execute(
-        "INSERT INTO jobs(user_id, token, status, save_path, created_at, expires_at) VALUES(?,?,?,?,?,?)",
-        (user_id, token, "queued", str(save_path), now, now + LINK_EXPIRY_HOURS * 3600),
+        "INSERT INTO jobs(user_id, token, status, save_path, created_at, expires_at, chat_id) VALUES(?,?,?,?,?,?,?)",
+        (user_id, token, "queued", str(save_path), now, now + LINK_EXPIRY_HOURS * 3600, chat_id),
     )
     conn.commit()
     return cur.lastrowid, token, save_path
+
+
+def progress_bar(progress: float, width: int = 18) -> str:
+    progress = max(0, min(1, progress or 0))
+    filled = round(progress * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def progress_text(job_id: int, status: str, progress: float, name: str | None = None) -> str:
+    pct = int(max(0, min(1, progress or 0)) * 100)
+    title = f"\n{name}" if name else ""
+    return f"⏳ Job #{job_id} {status}{title}\n[{progress_bar(progress)}] {pct}%"
+
+
+async def send_progress_message(update: Update, job_id: int) -> int:
+    text = progress_text(job_id, "queued", 0)
+    msg = await update.message.reply_text(text)
+    conn = db()
+    conn.execute("UPDATE jobs SET progress_message_id=?, last_progress_text=? WHERE id=?", (msg.message_id, text, job_id))
+    conn.commit()
+    return msg.message_id
+
+
+async def update_progress_message(bot_app: Application, row, text: str):
+    if not row["chat_id"] or not row["progress_message_id"] or row["last_progress_text"] == text:
+        return
+    try:
+        await bot_app.bot.edit_message_text(chat_id=row["chat_id"], message_id=row["progress_message_id"], text=text)
+        conn = db()
+        conn.execute("UPDATE jobs SET last_progress_text=? WHERE id=?", (text, row["id"]))
+        conn.commit()
+    except Exception as e:
+        print(f"progress edit error: {e}", flush=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,7 +161,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This bot is private.")
         return
     await update.message.reply_text(
-        "Send me a legal magnet link or .torrent file. I will download it and return only a temporary direct download link."
+        "Send me a legal magnet link or .torrent file. I will show a live progress bar here and return only a temporary direct download link."
     )
 
 
@@ -175,12 +219,13 @@ async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please send a magnet link or .torrent file.")
         return
     if active_count(update.effective_user.id) >= MAX_ACTIVE_JOBS_PER_USER:
-        await update.message.reply_text("You already have an active job. Use /status or /cancel.")
+        await update.message.reply_text("You already have an active job. Use /cancel.")
         return
-    job_id, token, save_path = make_job(update.effective_user.id)
+    job_id, token, save_path = make_job(update.effective_user.id, update.effective_chat.id)
+    await send_progress_message(update, job_id)
     try:
-        qbit().torrents_add(urls=text, save_path=str(save_path))
-        await update.message.reply_text(f"Added job #{job_id}. Use /status to check progress.")
+        client = qbit()
+        client.torrents_add(urls=text, save_path=str(save_path))
     except Exception as e:
         conn = db()
         conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
@@ -196,15 +241,15 @@ async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Please send a .torrent file.")
         return
     if active_count(update.effective_user.id) >= MAX_ACTIVE_JOBS_PER_USER:
-        await update.message.reply_text("You already have an active job. Use /status or /cancel.")
+        await update.message.reply_text("You already have an active job. Use /cancel.")
         return
-    job_id, token, save_path = make_job(update.effective_user.id)
+    job_id, token, save_path = make_job(update.effective_user.id, update.effective_chat.id)
+    await send_progress_message(update, job_id)
     torrent_path = save_path / "input.torrent"
     tg_file = await context.bot.get_file(doc.file_id)
     await tg_file.download_to_drive(str(torrent_path))
     try:
         qbit().torrents_add(torrent_files=str(torrent_path), save_path=str(save_path))
-        await update.message.reply_text(f"Added job #{job_id}. Use /status to check progress.")
     except Exception as e:
         conn = db()
         conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
@@ -226,14 +271,17 @@ async def monitor_loop(bot_app: Application):
                 if size_gb > MAX_TORRENT_SIZE_GB:
                     qbit().torrents_delete(torrent_hashes=t.hash, delete_files=True)
                     conn.execute("UPDATE jobs SET status='failed', torrent_hash=?, name=? WHERE id=?", (t.hash, t.name, r["id"]))
-                    await bot_app.bot.send_message(r["user_id"], f"Job #{r['id']} failed: torrent is over {MAX_TORRENT_SIZE_GB:g} GB.")
+                    await update_progress_message(bot_app, r, f"❌ Job #{r['id']} failed: torrent is over {MAX_TORRENT_SIZE_GB:g} GB.")
                     continue
                 progress = float(t.progress or 0)
                 status_value = "complete" if progress >= 1 else "downloading"
                 conn.execute("UPDATE jobs SET status=?, progress=?, torrent_hash=?, name=? WHERE id=?", (status_value, progress, t.hash, t.name, r["id"]))
-                if status_value == "complete" and r["status"] != "complete":
+                if status_value == "complete":
                     link = f"{PUBLIC_BASE_URL}/d/{r['token']}"
-                    await bot_app.bot.send_message(r["user_id"], f"✅ Download ready:\n{link}\n\nThis link expires in {LINK_EXPIRY_HOURS} hours.")
+                    text = f"✅ Download ready:\n{link}\n\n[{progress_bar(1)}] 100%\nThis link expires in {LINK_EXPIRY_HOURS} hours."
+                    await update_progress_message(bot_app, r, text)
+                else:
+                    await update_progress_message(bot_app, r, progress_text(r["id"], status_value, progress, t.name))
             conn.commit()
         except Exception as e:
             print(f"monitor error: {e}", flush=True)
@@ -290,7 +338,7 @@ async def main():
     db()
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("status", status))
+    # /status is intentionally not registered; progress updates are edited live in Telegram.
     bot_app.add_handler(CommandHandler("myfiles", myfiles))
     bot_app.add_handler(CommandHandler("cancel", cancel))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
