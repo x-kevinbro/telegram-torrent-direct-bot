@@ -1,0 +1,37 @@
+services:
+  bot:
+    build: ./app
+    env_file: .env
+    volumes:
+      - ./downloads:/downloads
+      - ./data:/data
+    depends_on:
+      - qbittorrent
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      - WEBUI_PORT=8080
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Colombo
+    volumes:
+      - ./qbittorrent-config:/config
+      - ./downloads:/downloads
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./downloads:/downloads:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - bot
+    restart: unless-stopped

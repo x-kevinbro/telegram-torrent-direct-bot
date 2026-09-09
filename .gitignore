@@ -1,0 +1,6 @@
+.env
+downloads/
+qbittorrent-config/
+data/
+__pycache__/
+*.pyc
