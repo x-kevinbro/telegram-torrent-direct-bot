@@ -1,31 +1,35 @@
-# Telegram Torrent Direct Bot
+# UpTunnel — Torrent to Direct Download
 
-A private Telegram bot that accepts permitted magnet links or `.torrent` files, downloads them through qBittorrent, and returns temporary direct download links. It does **not** upload completed files to Telegram.
+A self-hosted web app that turns magnet links and `.torrent` files into direct HTTPS download links, with in-browser streaming for media files.
 
-> Only use this with torrents you have the legal right to download or distribute.
+> Only download content you have the legal right to access.
 
 ## Features
 
-- Magnet link support
-- `.torrent` file support
-- qBittorrent Web API integration
-- Direct links via an internal FastAPI app
-- Nginx `X-Accel-Redirect` for efficient file serving
-- Admin allowlist
-- Link expiry
-- Automatic cleanup
-- `/status`, `/cancel`, `/myfiles`
+- Paste a magnet link or upload a `.torrent` file
+- Metadata loads first — nothing downloads until you choose
+- Select only the files you want (skipped files stay at priority 0)
+- Live progress page with speed, ETA, seeds/peers
+- In-browser player for video/audio files
+- Direct download links per file, or download everything as a ZIP
+- Automatic expiry and cleanup
+- Optional access-key gate for private use
 
-## Deployment
+## Stack
 
-1. Copy `.env.example` to `.env` and fill values.
-2. Point your domain to the server.
-3. Run:
+- FastAPI + uvicorn web app
+- qBittorrent (nox) as the torrent engine
+- Nginx for HTTPS + efficient file serving (X-Accel-Redirect)
+- SQLite for job tracking
+
+## Deploy
 
 ```bash
+cp .env.example .env
+# edit .env
 docker compose up -d --build
 ```
 
 ## Environment
 
-See `.env.example`.
+See `.env.example`. `SITE_KEY` protects the site with an access key when set.
