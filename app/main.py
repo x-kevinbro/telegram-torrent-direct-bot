@@ -563,7 +563,7 @@ def job_action(token: str, action: str):
 @app.get("/jobs", response_class=HTMLResponse)
 def jobs_page():
     conn = db()
-    rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 50").fetchall()
+    rows = conn.execute("SELECT * FROM jobs WHERE status NOT IN ('deleted','expired') ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
     items = []
     for r in rows:
