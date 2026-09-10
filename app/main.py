@@ -1,33 +1,40 @@
-import asyncio
 import html
 import os
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
+import zipfile
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+SITE_NAME = os.environ.get("SITE_NAME", "UpTunnel")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost").rstrip("/")
-ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
-QBIT_HOST = os.environ.get("QBIT_HOST", "http://qbittorrent:8080")
-QBIT_USERNAME = os.environ.get("QBIT_USERNAME", "admin")
-QBIT_PASSWORD = os.environ.get("QBIT_PASSWORD", "adminadmin")
+SITE_KEY = os.environ.get("SITE_KEY", "").strip()
+QBIT_HOST = os.environ.get("QBIT_HOST", "http://qbittorrent:8080").rstrip("/")
 MAX_TORRENT_SIZE_GB = float(os.environ.get("MAX_TORRENT_SIZE_GB", "150"))
-MAX_ACTIVE_JOBS_PER_USER = int(os.environ.get("MAX_ACTIVE_JOBS_PER_USER", "1"))
 LINK_EXPIRY_HOURS = int(os.environ.get("LINK_EXPIRY_HOURS", "24"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
-DATABASE_PATH = os.environ.get("DATABASE_PATH", "/data/bot.db")
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "/data/web.db")
 
-app = FastAPI()
+app = FastAPI(title=SITE_NAME)
+
+PLAYABLE = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac"}
+MIME = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
+    ".webm": "video/webm", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+    ".opus": "audio/ogg", ".wav": "audio/wav", ".flac": "audio/flac",
+}
+
+
+# ----------------------------- database -----------------------------
 
 def db():
     conn = sqlite3.connect(DATABASE_PATH, timeout=30)
@@ -36,345 +43,756 @@ def db():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
+        token TEXT UNIQUE NOT NULL,
         torrent_hash TEXT,
         name TEXT,
-        token TEXT UNIQUE NOT NULL,
         status TEXT NOT NULL,
         progress REAL DEFAULT 0,
+        total_size INTEGER DEFAULT 0,
         save_path TEXT NOT NULL,
+        error TEXT,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        chat_id INTEGER,
-        progress_message_id INTEGER,
-        last_progress_text TEXT
+        expires_at INTEGER NOT NULL
     )
     """)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    for column, ddl in {
-        "chat_id": "ALTER TABLE jobs ADD COLUMN chat_id INTEGER",
-        "progress_message_id": "ALTER TABLE jobs ADD COLUMN progress_message_id INTEGER",
-        "last_progress_text": "ALTER TABLE jobs ADD COLUMN last_progress_text TEXT",
-    }.items():
-        if column not in existing:
-            conn.execute(ddl)
     conn.commit()
     return conn
 
+
+def get_job(token):
+    conn = db()
+    row = conn.execute("SELECT * FROM jobs WHERE token=?", (token,)).fetchone()
+    conn.close()
+    return row
+
+
+def set_job(token, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    conn = db()
+    conn.execute(f"UPDATE jobs SET {cols} WHERE token=?", (*fields.values(), token))
+    conn.commit()
+    conn.close()
+
+
+def new_job():
+    token = secrets.token_urlsafe(18)
+    now = int(time.time())
+    save_path = DOWNLOAD_DIR / token
+    save_path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(save_path, 0o775)
+        os.chown(save_path, 1000, 1000)
+    except PermissionError:
+        pass
+    conn = db()
+    conn.execute(
+        "INSERT INTO jobs(token, status, save_path, created_at, expires_at) VALUES(?,?,?,?,?)",
+        (token, "metadata", str(save_path), now, now + LINK_EXPIRY_HOURS * 3600),
+    )
+    conn.commit()
+    conn.close()
+    return token, save_path
+
+
+# ----------------------------- qBittorrent -----------------------------
+
 class QbitClient:
     def __init__(self):
-        self.base = QBIT_HOST.rstrip("/")
-    def _post(self, path: str, data=None, files=None):
-        response = requests.post(f"{self.base}{path}", data=data or {}, files=files, timeout=30)
-        if response.status_code != 404:
-            response.raise_for_status()
-        return response
-    def _get(self, path: str):
-        response = requests.get(f"{self.base}{path}", timeout=30)
-        response.raise_for_status()
-        return response
-    def torrents_add(self, urls=None, torrent_files=None, save_path=None):
+        self.base = QBIT_HOST
+
+    def _post(self, path, data=None, files=None):
+        r = requests.post(f"{self.base}{path}", data=data or {}, files=files, timeout=60)
+        if r.status_code >= 400 and r.status_code not in (404, 409):
+            r.raise_for_status()
+        return r
+
+    def _get(self, path, params=None):
+        r = requests.get(f"{self.base}{path}", params=params or {}, timeout=30)
+        r.raise_for_status()
+        return r
+
+    def add(self, urls=None, torrent_file=None, save_path=None):
         data = {"savepath": save_path}
         files = None
         if urls:
             data["urls"] = urls
-        if torrent_files:
-            files = {"torrents": open(torrent_files, "rb")}
+        if torrent_file:
+            files = {"torrents": open(torrent_file, "rb")}
         try:
-            return self._post("/api/v2/torrents/add", data=data, files=files)
+            r = self._post("/api/v2/torrents/add", data=data, files=files)
+            if r.status_code == 409:
+                return "duplicate"
+            r.raise_for_status()
+            return "added"
         finally:
             if files:
                 files["torrents"].close()
-    def torrents_info(self):
-        return [type("Torrent", (), item) for item in self._get("/api/v2/torrents/info").json()]
-    def torrents_delete(self, torrent_hashes, delete_files=True):
-        return self._post("/api/v2/torrents/delete", data={"hashes": torrent_hashes, "deleteFiles": str(delete_files).lower()})
-    def torrents_start(self, torrent_hashes="all"):
-        response = self._post("/api/v2/torrents/start", data={"hashes": torrent_hashes})
-        if response.status_code == 404:
-            response = self._post("/api/v2/torrents/resume", data={"hashes": torrent_hashes})
-        return response
-    def torrents_pause(self, torrent_hashes="all"):
-        response = self._post("/api/v2/torrents/stop", data={"hashes": torrent_hashes})
-        if response.status_code == 404:
-            response = self._post("/api/v2/torrents/pause", data={"hashes": torrent_hashes})
-        return response
-    def torrents_recheck(self, torrent_hashes="all"):
-        return self._post("/api/v2/torrents/recheck", data={"hashes": torrent_hashes})
+
+    def info(self):
+        return self._get("/api/v2/torrents/info").json()
+
+    def files(self, torrent_hash):
+        return self._get("/api/v2/torrents/files", params={"hash": torrent_hash}).json()
+
+    def set_prio(self, torrent_hash, file_id, priority):
+        return self._post("/api/v2/torrents/filePrio", data={"hash": torrent_hash, "id": str(file_id), "priority": str(priority)})
+
+    def start(self, torrent_hash):
+        r = self._post("/api/v2/torrents/start", data={"hashes": torrent_hash})
+        if r.status_code == 404:
+            r = self._post("/api/v2/torrents/resume", data={"hashes": torrent_hash})
+        return r
+
+    def stop(self, torrent_hash):
+        r = self._post("/api/v2/torrents/stop", data={"hashes": torrent_hash})
+        if r.status_code == 404:
+            r = self._post("/api/v2/torrents/pause", data={"hashes": torrent_hash})
+        return r
+
+    def delete(self, torrent_hash, delete_files=True):
+        return self._post("/api/v2/torrents/delete", data={"hashes": torrent_hash, "deleteFiles": str(delete_files).lower()})
+
 
 def qbit():
     return QbitClient()
 
-def allowed(update: Update) -> bool:
-    return bool(update.effective_user and (not ADMIN_IDS or update.effective_user.id in ADMIN_IDS))
 
-def active_count(user_id: int) -> int:
-    conn = db()
-    return conn.execute("SELECT COUNT(*) c FROM jobs WHERE user_id=? AND status IN ('queued','downloading','stalledDL','paused')", (user_id,)).fetchone()["c"]
-
-def make_job(user_id: int, chat_id: int) -> tuple[int, str, Path]:
-    token = secrets.token_urlsafe(18)
-    now = int(time.time())
-    save_path = DOWNLOAD_DIR / f"user_{user_id}" / token
-    save_path.mkdir(parents=True, exist_ok=True)
-    os.chmod(save_path, 0o775)
+def find_torrent(client, row):
     try:
-        os.chown(save_path, 1000, 1000)
-        os.chown(save_path.parent, 1000, 1000)
-    except PermissionError:
-        pass
-    conn = db()
-    cur = conn.execute("INSERT INTO jobs(user_id, token, status, save_path, created_at, expires_at, chat_id) VALUES(?,?,?,?,?,?,?)", (user_id, token, "queued", str(save_path), now, now + LINK_EXPIRY_HOURS * 3600, chat_id))
-    conn.commit()
-    return cur.lastrowid, token, save_path
+        torrents = client.info()
+    except Exception:
+        return None
+    h = (row["torrent_hash"] or "").lower()
+    if h:
+        for t in torrents:
+            if str(t.get("hash", "")).lower() == h:
+                return t
+    for t in torrents:
+        if str(t.get("save_path", "")) == row["save_path"]:
+            return t
+    return None
 
-def progress_bar(progress: float, width: int = 18) -> str:
-    progress = max(0, min(1, progress or 0))
-    filled = round(progress * width)
-    return "█" * filled + "░" * (width - filled)
 
-def human_size(num: float) -> str:
+# ----------------------------- helpers -----------------------------
+
+def human_size(num):
+    num = float(num or 0)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if num < 1024 or unit == "TB":
             return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
         num /= 1024
 
-def human_eta(seconds) -> str:
+
+def human_eta(seconds):
     if seconds is None or seconds < 0 or seconds >= 8640000:
         return "unknown"
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}h {m}m" if h else (f"{m}m {sec}s" if m else f"{sec}s")
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
-def job_keyboard(job_id: int, status: str = "downloading") -> InlineKeyboardMarkup | None:
-    normalized = (status or "").lower()
-    if normalized in {"complete", "cancelled", "expired", "failed"} or "error" in normalized:
-        return None
-    if "pause" in normalized or "stop" in normalized or normalized in {"pauseddl", "pausedup", "stopped"}:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Resume", callback_data=f"resume:{job_id}")]])
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⏸ Pause", callback_data=f"pause:{job_id}")]])
 
-def progress_text(job_id: int, status: str, progress: float, name=None, speed=0, seeds=0, peers=0, downloaded=0, total=0, eta=None) -> str:
-    pct = int(max(0, min(1, progress or 0)) * 100)
-    title = f"\n{name}" if name else ""
-    details = f"\nSpeed: {human_size(speed)}/s | Seeds: {seeds} | Peers: {peers}"
-    if total:
-        details += f"\nDone: {human_size(downloaded)} / {human_size(total)}"
-    details += f"\nETA: {human_eta(eta)}"
-    icon = "⏸" if status == "paused" else "⏳"
-    return f"{icon} Job #{job_id} — {status}{title}\n[{progress_bar(progress)}] {pct}%{details}"
+def bar(fraction):
+    pct = int(max(0, min(1, fraction or 0)) * 100)
+    return f'<div class="bar"><i style="width:{pct}%"></i></div>'
 
-async def send_progress_message(update: Update, job_id: int) -> int:
-    text = progress_text(job_id, "queued", 0)
-    msg = await update.message.reply_text(text, reply_markup=job_keyboard(job_id, "queued"))
-    conn = db()
-    conn.execute("UPDATE jobs SET progress_message_id=?, last_progress_text=? WHERE id=?", (msg.message_id, text, job_id))
-    conn.commit()
-    return msg.message_id
 
-async def update_progress_message(bot_app: Application, row, text: str, status: str = "downloading"):
-    if not row["chat_id"] or not row["progress_message_id"]:
-        return
+def safe_rel_path(base: Path, rel_path: str) -> Path:
+    rel_path = unquote(rel_path).lstrip("/")
+    target = (base / rel_path).resolve()
+    if not str(target).startswith(str(base.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    return target
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+__REFRESH__
+<style>
+:root{--bg:#0a0f1e;--card:#111a2ecc;--line:#22314f;--txt:#e6edf7;--mut:#8ea0bf;--acc:#22d3ee;--acc2:#34d399}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:radial-gradient(1200px 600px at 80% -10%,#12324a55,transparent),radial-gradient(900px 500px at -10% 10%,#1a2a5255,transparent),var(--bg);color:var(--txt);min-height:100vh}
+a{color:var(--acc);text-decoration:none}
+.wrap{max-width:860px;margin:0 auto;padding:28px 18px 60px}
+.nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px}
+.brand{font-weight:800;font-size:22px;letter-spacing:.5px;color:var(--txt)}
+.brand span{color:var(--acc)}
+.nav a{color:var(--mut);margin-left:16px;font-size:14px}
+.nav a:hover{color:var(--txt)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px;margin:14px 0;backdrop-filter:blur(6px)}
+h1{margin:0 0 6px;font-size:26px;overflow-wrap:anywhere}
+h2{margin:0 0 10px;font-size:18px}
+p{color:var(--mut);line-height:1.55}
+textarea,input[type=file],input[type=password]{width:100%;background:#0a1322;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:14px;font-size:15px}
+textarea:focus,input:focus{outline:none;border-color:var(--acc)}
+.btn,button.btn{display:inline-block;background:linear-gradient(135deg,var(--acc),#0ea5b7);color:#04202a;font-weight:700;border:0;border-radius:12px;padding:12px 20px;font-size:15px;cursor:pointer;margin:6px 6px 6px 0}
+.btn:hover{filter:brightness(1.12)}
+.btn.ghost{background:#1b2942;color:var(--txt);border:1px solid var(--line)}
+.btn.danger{background:#ef4444;color:#fff}
+.row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--line);flex-wrap:wrap}
+.row:first-child{border-top:0}
+.name{overflow-wrap:anywhere;font-size:14px;flex:1;min-width:200px}
+.size{color:var(--mut);white-space:nowrap;font-size:13px}
+.bar{height:12px;background:#0a1322;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:12px 0}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:999px;transition:width .4s}
+.chip{display:inline-block;background:#132742;border:1px solid var(--line);color:var(--acc);border-radius:999px;padding:3px 12px;font-size:12px;font-weight:600}
+.mut{color:var(--mut);font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}
+.stat{background:#0a1322;border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.stat b{display:block;font-size:16px;margin-bottom:2px}
+.stat span{font-size:12px}
+label.row{cursor:pointer}
+label.row input{margin-right:10px;transform:scale(1.25)}
+video{width:100%;border-radius:12px;background:#000;margin-top:10px}
+.center{text-align:center}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:8px}
+.step{background:#0a1322;border:1px solid var(--line);border-radius:12px;padding:14px}
+.step b{color:var(--acc);font-size:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="nav"><div class="brand">__BRAND__</div><div><a href="/">Home</a><a href="/jobs">Downloads</a></div></div>
+__BODY__
+<p class="mut center" style="margin-top:34px">Only download content you have the rights to access. Links expire automatically.</p>
+</div>
+</body>
+</html>"""
+
+
+def html_page(title, body, refresh=None):
+    tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    return (
+        PAGE.replace("__TITLE__", html.escape(title))
+        .replace("__REFRESH__", tag)
+        .replace("__BRAND__", html.escape(SITE_NAME))
+        .replace("__BODY__", body)
+    )
+
+
+# ----------------------------- access gate -----------------------------
+
+def lock_page():
+    body = """
+    <div class="card" style="max-width:460px;margin:60px auto">
+      <h1>Private access</h1>
+      <p>This service is private. Enter the access key to continue.</p>
+      <form method="get" action="/unlock">
+        <input type="password" name="key" placeholder="Access key" autocomplete="off">
+        <p><button class="btn" type="submit">Unlock</button></p>
+      </form>
+    </div>
+    """
+    return html_page("Locked", body)
+
+
+@app.middleware("http")
+async def access_gate(request: Request, call_next):
+    if not SITE_KEY:
+        return await call_next(request)
+    path = request.url.path
+    if path in ("/health", "/unlock") or request.cookies.get("site_key") == SITE_KEY:
+        return await call_next(request)
+    if path == "/" and request.method == "GET":
+        return HTMLResponse(lock_page())
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/unlock")
+def unlock(key: str = ""):
+    if not SITE_KEY or key == SITE_KEY:
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("site_key", key, max_age=30 * 24 * 3600, httponly=True, secure=True, samesite="lax")
+        return resp
+    return HTMLResponse(lock_page(), status_code=403)
+
+
+# ----------------------------- pages -----------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    usage = shutil.disk_usage(DOWNLOAD_DIR)
+    used_frac = (usage.used / usage.total) if usage.total else 0
+    body = f"""
+    <div class="card center" style="padding:34px">
+      <h1 style="font-size:32px">Torrent to direct download</h1>
+      <p>Paste a magnet link or upload a .torrent file. We fetch it on the server, you pick the files, then stream or download them over HTTPS.</p>
+      <form method="post" action="/add-magnet">
+        <textarea name="magnet" rows="4" placeholder="magnet:?xt=urn:btih:..." required></textarea>
+        <p><button class="btn" type="submit">Fetch torrent</button></p>
+      </form>
+      <form method="post" action="/add-torrent" enctype="multipart/form-data">
+        <input type="file" name="torrent" accept=".torrent" required>
+        <p><button class="btn ghost" type="submit">Upload .torrent</button></p>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Server storage</h2>
+      {bar(used_frac)}
+      <p class="mut">Free {human_size(usage.free)} of {human_size(usage.total)} &middot; links expire after {LINK_EXPIRY_HOURS}h</p>
+    </div>
+    <div class="card">
+      <h2>How it works</h2>
+      <div class="steps">
+        <div class="step"><b>1</b><p>Add a magnet link or .torrent file.</p></div>
+        <div class="step"><b>2</b><p>We load the torrent and list its files.</p></div>
+        <div class="step"><b>3</b><p>Choose only the files you need.</p></div>
+        <div class="step"><b>4</b><p>Stream in your browser or download directly.</p></div>
+      </div>
+    </div>
+    """
+    return HTMLResponse(html_page(SITE_NAME, body))
+
+
+@app.post("/add-magnet")
+def add_magnet(magnet: str = Form(...)):
+    magnet = magnet.strip().replace("\\:", ":")
+    if not magnet.startswith("magnet:?"):
+        body = '<div class="card"><h1>Invalid magnet link</h1><p>Please paste a valid magnet URI starting with magnet:?xt=</p><p><a class="btn ghost" href="/">Back</a></p></div>'
+        return HTMLResponse(html_page("Invalid link", body), status_code=400)
+    token, save_path = new_job()
     try:
-        await bot_app.bot.edit_message_text(chat_id=row["chat_id"], message_id=row["progress_message_id"], text=text, reply_markup=job_keyboard(row["id"], status))
-        conn = db()
-        conn.execute("UPDATE jobs SET last_progress_text=? WHERE id=?", (text, row["id"]))
-        conn.commit()
+        result = qbit().add(urls=magnet, save_path=str(save_path))
     except Exception as e:
-        if "Message is not modified" not in str(e):
-            print(f"progress edit error: {e}", flush=True)
+        set_job(token, status="error", error=f"Failed to add torrent: {e}")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    if result == "duplicate":
+        shutil.rmtree(save_path, ignore_errors=True)
+        set_job(token, status="error", error="This torrent is already on the server. Delete the existing download first.")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    return RedirectResponse(f"/job/{token}", status_code=303)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        await update.message.reply_text("This bot is private.")
-        return
-    await update.message.reply_text("Send me a legal magnet link or .torrent file. I will show a live progress bar and a single Pause/Resume button.")
 
-async def myfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    conn = db()
-    rows = conn.execute("SELECT * FROM jobs WHERE user_id=? AND status='complete' AND expires_at>? ORDER BY id DESC LIMIT 10", (update.effective_user.id, int(time.time()))).fetchall()
-    if not rows:
-        await update.message.reply_text("No active download links.")
-        return
-    await update.message.reply_text("\n".join(f"{r['name'] or 'Download'}: {PUBLIC_BASE_URL}/d/{r['token']}" for r in rows))
+@app.post("/add-torrent")
+async def add_torrent(torrent: UploadFile = File(...)):
+    if not torrent.filename or not torrent.filename.lower().endswith(".torrent"):
+        body = '<div class="card"><h1>Invalid file</h1><p>Please upload a .torrent file.</p><p><a class="btn ghost" href="/">Back</a></p></div>'
+        return HTMLResponse(html_page("Invalid file", body), status_code=400)
+    token, save_path = new_job()
+    tpath = save_path / "input.torrent"
+    with open(tpath, "wb") as out:
+        shutil.copyfileobj(torrent.file, out)
+    client = qbit()
+    try:
+        result = client.add(torrent_file=str(tpath), save_path=str(save_path))
+    except Exception as e:
+        set_job(token, status="error", error=f"Failed to add torrent: {e}")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    if result == "duplicate":
+        shutil.rmtree(save_path, ignore_errors=True)
+        set_job(token, status="error", error="This torrent is already on the server. Delete the existing download first.")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    # .torrent files have metadata immediately: set all priorities to 0 now
+    try:
+        t = find_torrent(client, {"torrent_hash": None, "save_path": str(save_path)})
+        if t:
+            files = client.files(t["hash"])
+            for f in files:
+                client.set_prio(t["hash"], f["index"], 0)
+            if len(files) == 1:
+                client.set_prio(t["hash"], files[0]["index"], 1)
+                client.start(t["hash"])
+                set_job(token, status="downloading", torrent_hash=t["hash"], name=t.get("name"), total_size=t.get("total_size") or 0)
+            else:
+                set_job(token, status="waiting_selection", torrent_hash=t["hash"], name=t.get("name"), total_size=t.get("total_size") or 0)
+    except Exception as e:
+        print(f"post-add error: {e}", flush=True)
+    return RedirectResponse(f"/job/{token}", status_code=303)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    conn = db()
-    row = conn.execute("SELECT * FROM jobs WHERE user_id=? AND status IN ('queued','downloading','stalledDL','paused') ORDER BY id DESC LIMIT 1", (update.effective_user.id,)).fetchone()
+
+@app.get("/job/{token}", response_class=HTMLResponse)
+def job_page(token: str):
+    row = get_job(token)
     if not row:
-        await update.message.reply_text("No active job to cancel.")
-        return
-    try:
-        if row["torrent_hash"]:
-            qbit().torrents_delete(row["torrent_hash"], delete_files=True)
-    except Exception:
-        pass
-    conn.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (row["id"],))
-    conn.commit()
-    shutil.rmtree(row["save_path"], ignore_errors=True)
-    await update.message.reply_text("Cancelled latest active job.")
+        raise HTTPException(status_code=404, detail="Job not found")
+    status = row["status"]
+    name = html.escape(row["name"] or "Loading…")
 
-async def handle_magnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        await update.message.reply_text("This bot is private.")
-        return
-    text = (update.message.text or "").strip()
-    if not text.startswith("magnet:?"):
-        await update.message.reply_text("Please send a magnet link or .torrent file.")
-        return
-    if active_count(update.effective_user.id) >= MAX_ACTIVE_JOBS_PER_USER:
-        await update.message.reply_text("You already have an active job. Use /cancel.")
-        return
-    job_id, token, save_path = make_job(update.effective_user.id, update.effective_chat.id)
-    await send_progress_message(update, job_id)
-    try:
-        qbit().torrents_add(urls=text, save_path=str(save_path))
-    except Exception as e:
-        conn = db(); conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,)); conn.commit()
-        await update.message.reply_text(f"Failed to add torrent: {e}")
+    if status == "metadata":
+        body = f"""
+        <div class="card center">
+          <h1>Fetching torrent metadata</h1>
+          <p>Contacting peers and reading the file list. This page refreshes automatically.</p>
+          {bar(0.04)}
+        </div>"""
+        return HTMLResponse(html_page("Loading metadata", body, refresh=3))
 
-async def handle_torrent_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    doc = update.message.document
-    if not doc or not (doc.file_name or "").endswith(".torrent"):
-        await update.message.reply_text("Please send a .torrent file.")
-        return
-    if active_count(update.effective_user.id) >= MAX_ACTIVE_JOBS_PER_USER:
-        await update.message.reply_text("You already have an active job. Use /cancel.")
-        return
-    job_id, token, save_path = make_job(update.effective_user.id, update.effective_chat.id)
-    await send_progress_message(update, job_id)
-    torrent_path = save_path / "input.torrent"
-    tg_file = await context.bot.get_file(doc.file_id)
-    await tg_file.download_to_drive(str(torrent_path))
-    try:
-        qbit().torrents_add(torrent_files=str(torrent_path), save_path=str(save_path))
-    except Exception as e:
-        conn = db(); conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,)); conn.commit()
-        await update.message.reply_text(f"Failed to add torrent: {e}")
+    if status == "waiting_selection":
+        try:
+            files = qbit().files(row["torrent_hash"])
+        except Exception:
+            files = []
+        if not files:
+            body = f'<div class="card center"><h1>Loading file list…</h1><p>This page refreshes automatically.</p>{bar(0.1)}</div>'
+            return HTMLResponse(html_page("Loading files", body, refresh=3))
+        rows_html = []
+        for f in files:
+            idx = f.get("index")
+            rows_html.append(
+                f'<label class="row"><span class="name"><input type="checkbox" name="ids" value="{idx}" checked> {html.escape(f.get("name", "file"))}</span><span class="size">{human_size(f.get("size", 0))}</span></label>'
+            )
+        body = f"""
+        <div class="card">
+          <h1>{name}</h1>
+          <span class="chip">Ready &middot; {len(files)} file(s) &middot; {human_size(row['total_size'])}</span>
+          <p>Nothing is downloading yet. Select the files you want, then start.</p>
+          <form method="post" action="/start/{token}">
+            <p><button class="btn" type="submit">Download selected</button> <a class="btn danger" href="/action/{token}/delete">Cancel &amp; delete</a></p>
+            <div class="card" style="background:#0a1322">{''.join(rows_html)}</div>
+            <p><button class="btn" type="submit">Download selected</button></p>
+          </form>
+        </div>"""
+        return HTMLResponse(html_page("Choose files", body))
 
-async def button_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query.data or ":" not in query.data:
-        await query.answer(); return
-    action, job_id_text = query.data.split(":", 1)
-    job_id = int(job_id_text)
-    conn = db()
-    row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    if not row or (ADMIN_IDS and query.from_user.id not in ADMIN_IDS) or (not ADMIN_IDS and row["user_id"] != query.from_user.id):
-        await query.answer("Not allowed", show_alert=True); return
-    try:
+    if status in ("downloading", "paused"):
         client = qbit()
-        if action == "pause":
-            if row["torrent_hash"]:
-                client.torrents_pause(row["torrent_hash"])
-            conn.execute("UPDATE jobs SET status='paused' WHERE id=?", (job_id,)); conn.commit()
-            text = (row["last_progress_text"] or progress_text(job_id, "paused", row["progress"] or 0, row["name"])).replace("— downloading", "— paused").replace("— stalledDL", "— paused").replace("⏳", "⏸", 1)
-            await query.edit_message_text(text=text, reply_markup=job_keyboard(job_id, "paused"))
-            await query.answer("Paused")
-        elif action == "resume":
-            if row["torrent_hash"]:
-                client.torrents_start(row["torrent_hash"])
-            conn.execute("UPDATE jobs SET status='downloading' WHERE id=?", (job_id,)); conn.commit()
-            text = (row["last_progress_text"] or progress_text(job_id, "downloading", row["progress"] or 0, row["name"])).replace("— paused", "— downloading").replace("⏸", "⏳", 1)
-            await query.edit_message_text(text=text, reply_markup=job_keyboard(job_id, "downloading"))
-            await query.answer("Resumed")
-    except Exception as e:
-        await query.answer(f"Action failed: {e}", show_alert=True)
+        t = find_torrent(client, row)
+        pct = int((row["progress"] or 0) * 100)
+        speed, downloaded, total, eta, seeds, peers = "—", "—", human_size(row["total_size"]), "—", "—", "—"
+        if t:
+            pct = int(float(t.get("progress") or 0) * 100)
+            speed = human_size(t.get("dlspeed", 0)) + "/s"
+            downloaded = human_size(t.get("downloaded", 0))
+            total = human_size(t.get("total_size", 0))
+            eta = human_eta(t.get("eta"))
+            seeds = t.get("num_seeds", 0)
+            peers = t.get("num_leechs", 0)
+        label = "Paused" if status == "paused" else "Downloading"
+        toggle = f'<a class="btn ghost" href="/action/{token}/resume">Resume</a>' if status == "paused" else f'<a class="btn ghost" href="/action/{token}/pause">Pause</a>'
+        body = f"""
+        <div class="card">
+          <h1>{name}</h1>
+          <span class="chip">{label} &middot; {pct}%</span>
+          {bar(pct / 100)}
+          <div class="grid">
+            <div class="stat"><b>{speed}</b><span class="mut">Speed</span></div>
+            <div class="stat"><b>{downloaded}</b><span class="mut">Downloaded</span></div>
+            <div class="stat"><b>{total}</b><span class="mut">Total</span></div>
+            <div class="stat"><b>{eta}</b><span class="mut">ETA</span></div>
+            <div class="stat"><b>{seeds} / {peers}</b><span class="mut">Seeds / Peers</span></div>
+          </div>
+          <p>{toggle} <a class="btn danger" href="/action/{token}/delete">Delete</a></p>
+          <p class="mut">This page refreshes automatically every 5 seconds.</p>
+        </div>"""
+        return HTMLResponse(html_page(label, body, refresh=5))
 
-async def monitor_loop(bot_app: Application):
-    while True:
-        try:
-            conn = db()
-            rows = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','downloading','stalledDL','paused')").fetchall()
-            torrents = {str(t.save_path): t for t in qbit().torrents_info()}
-            for r in rows:
-                t = torrents.get(r["save_path"])
-                if not t:
-                    continue
-                progress = float(t.progress or 0)
-                qstate = str(getattr(t, "state", "unknown"))
-                if progress >= 1:
-                    status_value = "complete"
-                elif "pause" in qstate.lower() or "stop" in qstate.lower():
-                    status_value = "paused"
-                elif "error" in qstate.lower():
-                    status_value = "error"
-                else:
-                    status_value = qstate
-                conn.execute("UPDATE jobs SET status=?, progress=?, torrent_hash=?, name=? WHERE id=?", (status_value, progress, t.hash, t.name, r["id"]))
-                if status_value == "complete":
-                    link = f"{PUBLIC_BASE_URL}/d/{r['token']}"
-                    text = f"✅ Download ready:\n{link}\n\n[{progress_bar(1)}] 100%\nThis link expires in {LINK_EXPIRY_HOURS} hours."
-                    await update_progress_message(bot_app, r, text, status_value)
-                elif status_value == "error":
-                    await update_progress_message(bot_app, r, progress_text(r["id"], "error", progress, t.name, getattr(t,"dlspeed",0) or 0, getattr(t,"num_seeds",0) or 0, getattr(t,"connections_count",0) or 0, getattr(t,"downloaded",0) or 0, getattr(t,"total_size",0) or 0, getattr(t,"eta",None)), status_value)
-                else:
-                    await update_progress_message(bot_app, r, progress_text(r["id"], status_value, progress, t.name, getattr(t,"dlspeed",0) or 0, getattr(t,"num_seeds",0) or 0, getattr(t,"connections_count",0) or 0, getattr(t,"downloaded",0) or 0, getattr(t,"total_size",0) or 0, getattr(t,"eta",None)), status_value)
-            conn.commit()
-        except Exception as e:
-            print(f"monitor error: {e}", flush=True)
-        await asyncio.sleep(10)
+    if status == "complete":
+        return HTMLResponse(html_page(row["name"] or "Download", completed_body(row)))
 
-async def cleanup_loop():
-    while True:
+    if status == "error":
+        body = f"""
+        <div class="card">
+          <h1>Something went wrong</h1>
+          <p>{html.escape(row["error"] or "Unknown error")}</p>
+          <p><a class="btn ghost" href="/">Home</a> <a class="btn danger" href="/action/{token}/delete">Delete</a></p>
+        </div>"""
+        return HTMLResponse(html_page("Error", body))
+
+    body = '<div class="card"><h1>Expired</h1><p>This download expired or was deleted.</p><p><a class="btn ghost" href="/">Home</a></p></div>'
+    return HTMLResponse(html_page("Expired", body))
+
+
+@app.post("/start/{token}")
+def start_selected(token: str, ids: list[int] = Form(None)):
+    row = get_job(token)
+    if not row or row["status"] not in ("waiting_selection", "paused"):
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    client = qbit()
+    files = client.files(row["torrent_hash"])
+    if not files:
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    if not ids:
+        body = f'<div class="card"><h1>No files selected</h1><p>Select at least one file to download.</p><p><a class="btn ghost" href="/job/{token}">Back</a></p></div>'
+        return HTMLResponse(html_page("No files selected", body), status_code=400)
+    idset = {int(i) for i in ids}
+    selected_size = sum(f.get("size", 0) for f in files if f.get("index") in idset)
+    free = shutil.disk_usage(DOWNLOAD_DIR).free
+    if selected_size > free:
+        body = f'<div class="card"><h1>Not enough storage</h1><p>Selected files need {human_size(selected_size)} but only {human_size(free)} is free. Delete old downloads first.</p><p><a class="btn ghost" href="/jobs">Manage downloads</a></p></div>'
+        return HTMLResponse(html_page("Not enough storage", body), status_code=400)
+    for f in files:
+        client.set_prio(row["torrent_hash"], f["index"], 0)
+    for i in idset:
+        client.set_prio(row["torrent_hash"], i, 1)
+    client.start(row["torrent_hash"])
+    set_job(token, status="downloading")
+    return RedirectResponse(f"/job/{token}", status_code=303)
+
+
+@app.get("/action/{token}/{action}")
+def job_action(token: str, action: str):
+    row = get_job(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    client = qbit()
+    if action == "pause" and row["torrent_hash"]:
+        client.stop(row["torrent_hash"])
+        set_job(token, status="paused")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    if action == "resume" and row["torrent_hash"]:
+        client.start(row["torrent_hash"])
+        set_job(token, status="downloading")
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    if action == "delete":
         try:
-            now = int(time.time())
-            conn = db()
-            rows = conn.execute("SELECT * FROM jobs WHERE expires_at < ? AND status != 'expired'", (now,)).fetchall()
-            for r in rows:
-                try:
-                    if r["torrent_hash"]:
-                        qbit().torrents_delete(r["torrent_hash"], delete_files=True)
-                except Exception:
-                    pass
-                shutil.rmtree(r["save_path"], ignore_errors=True)
-                conn.execute("UPDATE jobs SET status='expired' WHERE id=?", (r["id"],))
-            conn.commit()
-        except Exception as e:
-            print(f"cleanup error: {e}", flush=True)
-        await asyncio.sleep(3600)
+            if row["torrent_hash"]:
+                client.delete(row["torrent_hash"], True)
+        except Exception:
+            pass
+        shutil.rmtree(row["save_path"], ignore_errors=True)
+        set_job(token, status="deleted")
+        return RedirectResponse("/jobs", status_code=303)
+    raise HTTPException(status_code=404, detail="Unknown action")
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+def jobs_page():
+    conn = db()
+    rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 50").fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        pct = int((r["progress"] or 0) * 100)
+        items.append(f"""
+        <div class="card">
+          <div class="row"><span class="name"><b>#{r['id']}</b> {html.escape(r['name'] or 'Loading…')}</span>
+          <span class="chip">{html.escape(r['status'])} &middot; {pct}%</span></div>
+          {bar(r["progress"] or 0)}
+          <p class="mut">{human_size(r['total_size'])}</p>
+          <p><a class="btn ghost" href="/job/{r['token']}">Open</a> <a class="btn danger" href="/action/{r['token']}/delete">Delete</a></p>
+        </div>""")
+    usage = shutil.disk_usage(DOWNLOAD_DIR)
+    body = f"""
+    <div class="card"><h1>Downloads</h1><p class="mut">Free {human_size(usage.free)} of {human_size(usage.total)}</p></div>
+    {''.join(items) if items else '<div class="card"><p>No downloads yet.</p></div>'}
+    """
+    return HTMLResponse(html_page("Downloads", body))
+
+
+# ----------------------------- completed files -----------------------------
+
+def completed_body(row):
+    base = Path(row["save_path"])
+    token = row["token"]
+    files = sorted(
+        [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and "_zip_extract" not in x.parts],
+        key=lambda x: str(x).lower(),
+    )
+    if not files:
+        return '<div class="card"><h1>No files found</h1><p>The download folder is empty.</p><p><a class="btn ghost" href="/">Home</a></p></div>'
+    items = []
+    for f in files:
+        rel = f.relative_to(base)
+        qrel = quote(str(rel))
+        play = ""
+        if f.suffix.lower() in PLAYABLE:
+            play = f'<a class="btn" href="/watch/{token}/{qrel}">Play</a>'
+        items.append(
+            f'<div class="row"><span class="name">{html.escape(str(rel))}</span><span class="size">{human_size(f.stat().st_size)}</span><span>{play} <a class="btn ghost" href="/file/{token}/{qrel}">Download</a></span></div>'
+        )
+    title = html.escape(row["name"] or "Download")
+    player = ""
+    if len(files) == 1 and files[0].suffix.lower() in PLAYABLE:
+        qrel = quote(str(files[0].relative_to(base)))
+        player = f'<div class="card"><video controls preload="metadata" src="/stream/{token}/{qrel}"></video></div>'
+    return f"""
+    <div class="card">
+      <h1>{title}</h1>
+      <span class="chip">Complete &middot; expires in {LINK_EXPIRY_HOURS}h</span>
+      <p><a class="btn" href="/zip/{token}">Download all as ZIP</a> <a class="btn danger" href="/action/{token}/delete">Delete files</a></p>
+    </div>
+    {player}
+    <div class="card">{''.join(items)}</div>"""
+
+
+@app.get("/files/{token}", response_class=HTMLResponse)
+def browse_files(token: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    return HTMLResponse(html_page(row["name"] or "Files", completed_body(row)))
+
+
+@app.get("/file/{token}/{rel_path:path}")
+def download_file(token: str, rel_path: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    target = safe_rel_path(Path(row["save_path"]), rel_path)
+    if not target.exists() or not target.is_file() or target.name == "input.torrent":
+        raise HTTPException(status_code=404, detail="File not found")
+    rel = target.relative_to(DOWNLOAD_DIR)
+    headers = {
+        "X-Accel-Redirect": "/_protected_downloads/" + quote(str(rel)),
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(target.name)}",
+    }
+    return Response(status_code=200, headers=headers)
+
+
+@app.get("/stream/{token}/{rel_path:path}")
+def stream_file(token: str, rel_path: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    target = safe_rel_path(Path(row["save_path"]), rel_path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    rel = target.relative_to(DOWNLOAD_DIR)
+    headers = {
+        "X-Accel-Redirect": "/_protected_downloads/" + quote(str(rel)),
+        "Content-Type": MIME.get(target.suffix.lower(), "application/octet-stream"),
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(target.name)}",
+        "Accept-Ranges": "bytes",
+    }
+    return Response(status_code=200, headers=headers)
+
+
+@app.get("/watch/{token}/{rel_path:path}", response_class=HTMLResponse)
+def watch_file(token: str, rel_path: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    name = html.escape(Path(unquote(rel_path)).name)
+    body = f"""
+    <div class="card">
+      <h1>{name}</h1>
+      <video controls preload="metadata" src="/stream/{token}/{rel_path}"></video>
+      <p><a class="btn ghost" href="/job/{token}">Back to files</a> <a class="btn" href="/file/{token}/{rel_path}">Download file</a></p>
+    </div>"""
+    return HTMLResponse(html_page(name, body))
+
+
+@app.get("/zip/{token}")
+def download_zip(token: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    base = Path(row["save_path"])
+    files = [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and "_zip_extract" not in x.parts]
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found")
+    zip_path = base / f"{token}.zip"
+    if not zip_path.exists():
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for f in files:
+                zf.write(f, f.relative_to(base))
+    rel = zip_path.relative_to(DOWNLOAD_DIR)
+    headers = {
+        "X-Accel-Redirect": "/_protected_downloads/" + quote(str(rel)),
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote((row['name'] or token) + '.zip')}",
+    }
+    return Response(status_code=200, headers=headers)
+
+
+# ----------------------------- api -----------------------------
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/d/{token}")
-def download(token: str):
-    conn = db()
-    row = conn.execute("SELECT * FROM jobs WHERE token=?", (token,)).fetchone()
-    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
-        raise HTTPException(status_code=404, detail="Link not found or expired")
-    base = Path(row["save_path"])
-    files = [p for p in base.rglob("*") if p.is_file() and p.name != "input.torrent"]
-    if not files:
-        raise HTTPException(status_code=404, detail="No completed file found")
-    target = max(files, key=lambda p: p.stat().st_size)
-    rel = target.relative_to(DOWNLOAD_DIR)
-    headers = {"X-Accel-Redirect": "/_protected_downloads/" + quote(str(rel)), "Content-Disposition": f"attachment; filename*=UTF-8''{quote(target.name)}"}
-    return Response(status_code=200, headers=headers)
 
-async def main():
+@app.get("/api/job/{token}")
+def job_api(token: str):
+    row = get_job(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "token": row["token"],
+        "name": row["name"],
+        "status": row["status"],
+        "progress": row["progress"],
+        "total_size": row["total_size"],
+        "expires_at": row["expires_at"],
+    }
+
+
+# ----------------------------- monitor -----------------------------
+
+def monitor():
+    while True:
+        try:
+            conn = db()
+            rows = conn.execute("SELECT * FROM jobs WHERE status IN ('metadata','waiting_selection','downloading','paused')").fetchall()
+            client = qbit()
+            try:
+                torrents = client.info()
+            except Exception:
+                torrents = []
+            by_path = {str(t.get("save_path", "")): t for t in torrents}
+            by_hash = {str(t.get("hash", "")).lower(): t for t in torrents}
+            for row in rows:
+                t = None
+                h = (row["torrent_hash"] or "").lower()
+                if h and h in by_hash:
+                    t = by_hash[h]
+                elif row["save_path"] in by_path:
+                    t = by_path[row["save_path"]]
+                if not t:
+                    continue
+                size_gb = (t.get("total_size") or 0) / (1024 ** 3)
+                if size_gb > MAX_TORRENT_SIZE_GB:
+                    client.delete(t["hash"], True)
+                    shutil.rmtree(row["save_path"], ignore_errors=True)
+                    conn.execute("UPDATE jobs SET status='error', error=? WHERE id=?", (f"Torrent exceeds the {MAX_TORRENT_SIZE_GB:g} GB limit.", row["id"]))
+                    continue
+                if row["status"] == "metadata" and t.get("has_metadata"):
+                    try:
+                        files = client.files(t["hash"])
+                    except Exception:
+                        files = []
+                    if files:
+                        for f in files:
+                            client.set_prio(t["hash"], f["index"], 0)
+                        if len(files) == 1:
+                            client.set_prio(t["hash"], files[0]["index"], 1)
+                            client.start(t["hash"])
+                            new_status = "downloading"
+                        else:
+                            new_status = "waiting_selection"
+                        conn.execute(
+                            "UPDATE jobs SET status=?, torrent_hash=?, name=?, total_size=? WHERE id=?",
+                            (new_status, t["hash"], t.get("name"), t.get("total_size") or 0, row["id"]),
+                        )
+                elif row["status"] in ("downloading", "paused"):
+                    prog = float(t.get("progress") or 0)
+                    new_status = "complete" if prog >= 1 else row["status"]
+                    conn.execute(
+                        "UPDATE jobs SET status=?, progress=?, torrent_hash=?, name=?, total_size=? WHERE id=?",
+                        (new_status, prog, t["hash"], t.get("name"), t.get("total_size") or 0, row["id"]),
+                    )
+            now = int(time.time())
+            expired = conn.execute("SELECT * FROM jobs WHERE expires_at < ? AND status NOT IN ('expired','deleted')", (now,)).fetchall()
+            for row in expired:
+                try:
+                    if row["torrent_hash"]:
+                        client.delete(row["torrent_hash"], True)
+                except Exception:
+                    pass
+                shutil.rmtree(row["save_path"], ignore_errors=True)
+                conn.execute("UPDATE jobs SET status='expired' WHERE id=?", (row["id"],))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"monitor error: {e}", flush=True)
+        time.sleep(4)
+
+
+def main():
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     db()
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("myfiles", myfiles))
-    bot_app.add_handler(CommandHandler("cancel", cancel))
-    bot_app.add_handler(CallbackQueryHandler(button_action))
-    bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_torrent_file))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_magnet))
-    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info"))
-    await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
-    try:
-        await asyncio.gather(server.serve(), monitor_loop(bot_app), cleanup_loop())
-    finally:
-        await bot_app.updater.stop(); await bot_app.stop(); await bot_app.shutdown()
+    threading.Thread(target=monitor, daemon=True).start()
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
