@@ -301,7 +301,12 @@ async def access_gate(request: Request, call_next):
     if not SITE_KEY:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/unlock") or request.cookies.get("site_key") == SITE_KEY:
+    # Share links authenticate via their unguessable token, so download managers
+    # (no cookies) can fetch them. Everything else needs the site key cookie.
+    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/")
+    if path in ("/health", "/unlock") or path.startswith(token_paths):
+        return await call_next(request)
+    if request.cookies.get("site_key") == SITE_KEY:
         return await call_next(request)
     if path == "/" and request.method == "GET":
         return HTMLResponse(lock_page())
