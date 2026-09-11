@@ -287,8 +287,12 @@ def s3_enabled():
 
 def s3_client():
     import boto3
+    from botocore.config import Config
+    cfg = Config(s3={"addressing_style": "path"},
+                 request_checksum_calculation="when_required",
+                 response_checksum_validation="when_required")
     return boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=S3_REGION,
-                        aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY)
+                        aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY, config=cfg)
 
 def job_local_files(base: Path):
     return sorted(
