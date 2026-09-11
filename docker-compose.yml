@@ -5,6 +5,8 @@ services:
     volumes:
       - ./downloads:/downloads
       - ./data:/data
+      - ./ffmpeg-bin/ffmpeg:/usr/local/bin/ffmpeg:ro
+      - ./app:/app
     depends_on:
       - qbittorrent
     restart: unless-stopped
