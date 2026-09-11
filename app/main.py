@@ -33,6 +33,14 @@ S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "").strip()
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "").strip()
 S3_PUBLIC_URL = os.environ.get("S3_PUBLIC_URL", "").rstrip("/")
 S3_AUTO_OFFLOAD = os.environ.get("S3_AUTO_OFFLOAD", "0") == "1"
+S3B_ENDPOINT = os.environ.get("S3B_ENDPOINT", "").strip()
+S3B_REGION = os.environ.get("S3B_REGION", "auto").strip()
+S3B_BUCKET = os.environ.get("S3B_BUCKET", "").strip()
+S3B_ACCESS_KEY = os.environ.get("S3B_ACCESS_KEY", "").strip()
+S3B_SECRET_KEY = os.environ.get("S3B_SECRET_KEY", "").strip()
+S3B_PUBLIC_URL = os.environ.get("S3B_PUBLIC_URL", "").rstrip("/")
+S3_SPLIT_BYTES = int(float(os.environ.get("S3_SPLIT_GB", "20")) * (1024 ** 3))
+OCI_HOOK_SECRET = os.environ.get("OCI_HOOK_SECRET", "").strip()
 OFFLOAD_JOBS = {}
 LINK_EXPIRY_HOURS = int(os.environ.get("LINK_EXPIRY_HOURS", "24"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
@@ -282,17 +290,35 @@ def notify(text):
     except Exception as e:
         print(f"notify error: {e}", flush=True)
 
-def s3_enabled():
-    return bool(S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY and S3_PUBLIC_URL)
+def s3_target_a():
+    return {"endpoint": S3_ENDPOINT, "region": S3_REGION, "bucket": S3_BUCKET,
+            "access": S3_ACCESS_KEY, "secret": S3_SECRET_KEY, "public": S3_PUBLIC_URL}
 
-def s3_client():
+def s3_target_b():
+    return {"endpoint": S3B_ENDPOINT, "region": S3B_REGION, "bucket": S3B_BUCKET,
+            "access": S3B_ACCESS_KEY, "secret": S3B_SECRET_KEY, "public": S3B_PUBLIC_URL}
+
+def s3_target_ok(t):
+    return bool(t["endpoint"] and t["bucket"] and t["access"] and t["secret"] and t["public"])
+
+def s3_enabled():
+    return s3_target_ok(s3_target_a())
+
+def s3_client(t=None):
     import boto3
     from botocore.config import Config
+    t = t or s3_target_a()
     cfg = Config(s3={"addressing_style": "path"},
                  request_checksum_calculation="when_required",
                  response_checksum_validation="when_required")
-    return boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=S3_REGION,
-                        aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY, config=cfg)
+    return boto3.client("s3", endpoint_url=t["endpoint"], region_name=t["region"],
+                        aws_access_key_id=t["access"], aws_secret_access_key=t["secret"], config=cfg)
+
+def s3_target_for_size(size):
+    # Files up to S3_SPLIT_BYTES go to the primary (free-tier) target; bigger ones to the secondary.
+    if s3_target_ok(s3_target_b()) and size > S3_SPLIT_BYTES:
+        return "b", s3_target_b()
+    return "a", s3_target_a()
 
 def job_local_files(base: Path):
     return sorted(
@@ -310,7 +336,7 @@ def job_manifest(row):
     base = Path(row["save_path"])
     return [{"rel": str(f.relative_to(base)), "size": f.stat().st_size} for f in job_local_files(base)]
 
-def manifest_key(row, rel_path):
+def manifest_entry(row, rel_path):
     rel_path = unquote(rel_path).lstrip("/")
     try:
         manifest = json.loads(row["files_json"] or "[]")
@@ -318,8 +344,12 @@ def manifest_key(row, rel_path):
         return None
     for m in manifest:
         if m["rel"] == rel_path:
-            return m["key"]
+            return m
     return None
+
+def manifest_public_url(m):
+    t = s3_target_b() if m.get("store") == "b" else s3_target_a()
+    return f"{t['public']}/{quote(m['key'])}"
 
 def do_offload(token):
     try:
@@ -329,13 +359,19 @@ def do_offload(token):
             return
         base = Path(row["save_path"])
         files = job_local_files(base)
-        client = s3_client()
+        clients = {}
+        buckets = {}
         manifest = []
         for f in files:
             rel = str(f.relative_to(base))
+            size = f.stat().st_size
+            store, t = s3_target_for_size(size)
+            if store not in clients:
+                clients[store] = s3_client(t)
+                buckets[store] = t["bucket"]
             key = f"{token}/{rel}"
-            client.upload_file(str(f), S3_BUCKET, key)
-            manifest.append({"rel": rel, "size": f.stat().st_size, "key": key})
+            clients[store].upload_file(str(f), buckets[store], key)
+            manifest.append({"rel": rel, "size": size, "key": key, "store": store})
         set_job(token, files_json=json.dumps(manifest), offloaded=1)
         try:
             if row["torrent_hash"]:
@@ -353,9 +389,15 @@ def delete_s3_files(row):
     if not row["offloaded"]:
         return
     try:
-        c = s3_client()
+        clients = {}
+        buckets = {}
         for m in json.loads(row["files_json"] or "[]"):
-            c.delete_object(Bucket=S3_BUCKET, Key=m["key"])
+            store = m.get("store", "a")
+            if store not in clients:
+                t = s3_target_b() if store == "b" else s3_target_a()
+                clients[store] = s3_client(t)
+                buckets[store] = t["bucket"]
+            clients[store].delete_object(Bucket=buckets[store], Key=m["key"])
     except Exception as e:
         print(f"s3 cleanup error: {e}", flush=True)
 
@@ -458,7 +500,7 @@ async def access_gate(request: Request, call_next):
     path = request.url.path
     # Share links authenticate via their unguessable token, so download managers
     # (no cookies) can fetch them. Everything else needs the site key cookie.
-    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/", "/remux/", "/subtitle/", "/links/", "/gate/")
+    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/", "/remux/", "/subtitle/", "/links/", "/gate/", "/oci-events/")
     if path in ("/health", "/unlock") or path.startswith(token_paths):
         return await call_next(request)
     if request.cookies.get("site_key") == SITE_KEY:
@@ -864,10 +906,10 @@ def download_file(token: str, rel_path: str, request: Request):
     if denied:
         return denied
     if row["offloaded"]:
-        key = manifest_key(row, rel_path)
-        if not key:
+        m = manifest_entry(row, rel_path)
+        if not m:
             raise HTTPException(status_code=404, detail="File not found")
-        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
+        return RedirectResponse(manifest_public_url(m), status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file() or target.name == "input.torrent":
         raise HTTPException(status_code=404, detail="File not found")
@@ -887,10 +929,10 @@ def stream_file(token: str, rel_path: str, request: Request):
     if denied:
         return denied
     if row["offloaded"]:
-        key = manifest_key(row, rel_path)
-        if not key:
+        m = manifest_entry(row, rel_path)
+        if not m:
             raise HTTPException(status_code=404, detail="File not found")
-        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
+        return RedirectResponse(manifest_public_url(m), status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -989,10 +1031,10 @@ def subtitle_file(token: str, rel_path: str, request: Request):
     if denied:
         return denied
     if row["offloaded"]:
-        key = manifest_key(row, rel_path)
-        if not key:
+        m = manifest_entry(row, rel_path)
+        if not m:
             raise HTTPException(status_code=404, detail="Subtitle not found")
-        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
+        return RedirectResponse(manifest_public_url(m), status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file() or target.suffix.lower() not in SUBTITLES:
         raise HTTPException(status_code=404, detail="Subtitle not found")
@@ -1098,6 +1140,50 @@ def offload_now(token: str):
     OFFLOAD_JOBS[token] = "running"
     threading.Thread(target=do_offload, args=(token,), daemon=True).start()
     return RedirectResponse(f"/job/{token}", status_code=303)
+
+@app.post("/oci-events/{secret}")
+async def oci_events(secret: str, request: Request):
+    if not OCI_HOOK_SECRET or secret != OCI_HOOK_SECRET:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+    sub_url = payload.get("SubscribeURL") or payload.get("subscribeURL")
+    if sub_url:
+        try:
+            requests.get(sub_url, timeout=15)
+            print("oci subscription confirmed", flush=True)
+        except Exception as e:
+            print(f"oci confirm error: {e}", flush=True)
+        return {"ok": True}
+    events = payload if isinstance(payload, list) else [payload]
+    sent = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("message")
+        if isinstance(msg, str):
+            try:
+                ev = json.loads(msg)
+            except Exception:
+                continue
+        etype = ev.get("eventType", "")
+        data = ev.get("data", {}) if isinstance(ev.get("data"), dict) else {}
+        name = data.get("resourceName", "")
+        if "createobject" in etype:
+            text = f"☁️ File stored in Oracle bucket: {name}"
+        elif "deleteobject" in etype:
+            text = f"🗑 File deleted from Oracle bucket: {name}"
+        elif etype:
+            text = f"☁️ Oracle event: {etype} {name}"
+        else:
+            continue
+        notify(text)
+        sent += 1
+        if sent >= 10:
+            break
+    return {"ok": True, "sent": sent}
 
 # ----------------------------- api -----------------------------
 
