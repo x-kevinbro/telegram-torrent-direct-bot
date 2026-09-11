@@ -1,6 +1,8 @@
 import html
 import os
+import re
 import secrets
+import subprocess
 import shutil
 import sqlite3
 import threading
@@ -19,20 +21,24 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost").rstrip("
 SITE_KEY = os.environ.get("SITE_KEY", "").strip()
 QBIT_HOST = os.environ.get("QBIT_HOST", "http://qbittorrent:8080").rstrip("/")
 MAX_TORRENT_SIZE_GB = float(os.environ.get("MAX_TORRENT_SIZE_GB", "150"))
+MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", "2"))
+MIN_FREE_BYTES = int(float(os.environ.get("MIN_FREE_GB", "2")) * (1024 ** 3))
 LINK_EXPIRY_HOURS = int(os.environ.get("LINK_EXPIRY_HOURS", "24"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "/data/web.db")
 
 app = FastAPI(title=SITE_NAME)
 
-PLAYABLE = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac"}
+PLAYABLE = {".mp4", ".webm", ".mov", ".m4v", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac"}
+REMUXABLE = {".mkv", ".avi"}
+SUBTITLES = {".srt", ".vtt"}
+REMUX_JOBS = {}
 MIME = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
     ".webm": "video/webm", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
     ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
     ".opus": "audio/ogg", ".wav": "audio/wav", ".flac": "audio/flac",
 }
-
 
 # ----------------------------- database -----------------------------
 
@@ -52,19 +58,21 @@ def db():
         save_path TEXT NOT NULL,
         error TEXT,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        selected_ids TEXT
     )
     """)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "selected_ids" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN selected_ids TEXT")
     conn.commit()
     return conn
-
 
 def get_job(token):
     conn = db()
     row = conn.execute("SELECT * FROM jobs WHERE token=?", (token,)).fetchone()
     conn.close()
     return row
-
 
 def set_job(token, **fields):
     if not fields:
@@ -74,7 +82,6 @@ def set_job(token, **fields):
     conn.execute(f"UPDATE jobs SET {cols} WHERE token=?", (*fields.values(), token))
     conn.commit()
     conn.close()
-
 
 def new_job():
     token = secrets.token_urlsafe(18)
@@ -94,7 +101,6 @@ def new_job():
     conn.commit()
     conn.close()
     return token, save_path
-
 
 # ----------------------------- qBittorrent -----------------------------
 
@@ -162,10 +168,8 @@ class QbitClient:
         if not t.get("f_l_piece_prio"):
             self._post("/api/v2/torrents/toggleFirstLastPiecePrio", data={"hash": t["hash"]})
 
-
 def qbit():
     return QbitClient()
-
 
 def find_torrent(client, row):
     try:
@@ -182,7 +186,6 @@ def find_torrent(client, row):
             return t
     return None
 
-
 # ----------------------------- helpers -----------------------------
 
 def human_size(num):
@@ -191,7 +194,6 @@ def human_size(num):
         if num < 1024 or unit == "TB":
             return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
         num /= 1024
-
 
 def human_eta(seconds):
     if seconds is None or seconds < 0 or seconds >= 8640000:
@@ -205,11 +207,9 @@ def human_eta(seconds):
         return f"{m}m {s}s"
     return f"{s}s"
 
-
 def bar(fraction):
     pct = int(max(0, min(1, fraction or 0)) * 100)
     return f'<div class="bar"><i style="width:{pct}%"></i></div>'
-
 
 def safe_rel_path(base: Path, rel_path: str) -> Path:
     rel_path = unquote(rel_path).lstrip("/")
@@ -218,6 +218,39 @@ def safe_rel_path(base: Path, rel_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Invalid path")
     return target
 
+def find_subtitle(base: Path, video: Path):
+    folder = video.parent
+    stem = video.stem
+    subs = sorted([p for p in folder.glob("*") if p.suffix.lower() in SUBTITLES], key=lambda x: x.name.lower())
+    for sub in subs:
+        if sub.stem == stem:
+            return sub
+    return subs[0] if subs else None
+
+def srt_to_vtt(raw: bytes) -> str:
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\d{1,2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", text)
+    return "WEBVTT\n\n" + text.strip() + "\n"
+
+def do_remux(key, src: Path, out: Path):
+    tmp = out.with_name(out.stem + ".remuxing.mp4")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+             "-movflags", "+faststart", str(tmp)],
+            capture_output=True, timeout=3600,
+        )
+        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            tmp.rename(out)
+            REMUX_JOBS[key] = "done"
+        else:
+            err = proc.stderr.decode(errors="replace")[-400:] if proc.stderr else "conversion failed"
+            REMUX_JOBS[key] = "error: " + err
+            tmp.unlink(missing_ok=True)
+    except Exception as e:
+        REMUX_JOBS[key] = f"error: {e}"
+        tmp.unlink(missing_ok=True)
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -277,7 +310,6 @@ __BODY__
 </body>
 </html>"""
 
-
 def html_page(title, body, refresh=None):
     tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return (
@@ -286,7 +318,6 @@ def html_page(title, body, refresh=None):
         .replace("__BRAND__", html.escape(SITE_NAME))
         .replace("__BODY__", body)
     )
-
 
 # ----------------------------- access gate -----------------------------
 
@@ -303,7 +334,6 @@ def lock_page():
     """
     return html_page("Locked", body)
 
-
 @app.middleware("http")
 async def access_gate(request: Request, call_next):
     if not SITE_KEY:
@@ -311,7 +341,7 @@ async def access_gate(request: Request, call_next):
     path = request.url.path
     # Share links authenticate via their unguessable token, so download managers
     # (no cookies) can fetch them. Everything else needs the site key cookie.
-    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/")
+    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/", "/remux/", "/subtitle/")
     if path in ("/health", "/unlock") or path.startswith(token_paths):
         return await call_next(request)
     if request.cookies.get("site_key") == SITE_KEY:
@@ -320,7 +350,6 @@ async def access_gate(request: Request, call_next):
         return HTMLResponse(lock_page())
     return RedirectResponse("/", status_code=303)
 
-
 @app.get("/unlock")
 def unlock(key: str = ""):
     if not SITE_KEY or key == SITE_KEY:
@@ -328,7 +357,6 @@ def unlock(key: str = ""):
         resp.set_cookie("site_key", key, max_age=30 * 24 * 3600, httponly=True, secure=True, samesite="lax")
         return resp
     return HTMLResponse(lock_page(), status_code=403)
-
 
 # ----------------------------- pages -----------------------------
 
@@ -366,7 +394,6 @@ def home():
     """
     return HTMLResponse(html_page(SITE_NAME, body))
 
-
 @app.post("/add-magnet")
 def add_magnet(magnet: str = Form(...)):
     magnet = magnet.strip().replace("\\:", ":")
@@ -384,7 +411,6 @@ def add_magnet(magnet: str = Form(...)):
         set_job(token, status="error", error="This torrent is already on the server. Delete the existing download first.")
         return RedirectResponse(f"/job/{token}", status_code=303)
     return RedirectResponse(f"/job/{token}", status_code=303)
-
 
 @app.post("/add-torrent")
 async def add_torrent(torrent: UploadFile = File(...)):
@@ -421,7 +447,6 @@ async def add_torrent(torrent: UploadFile = File(...)):
     except Exception as e:
         print(f"post-add error: {e}", flush=True)
     return RedirectResponse(f"/job/{token}", status_code=303)
-
 
 @app.get("/job/{token}", response_class=HTMLResponse)
 def job_page(token: str):
@@ -496,11 +521,14 @@ def job_page(token: str):
                 fsize = human_size(f.get("size", 0))
                 qname = quote(fname)
                 action = ""
-                if Path(fname).suffix.lower() in PLAYABLE:
+                ext = Path(fname).suffix.lower()
+                if ext in PLAYABLE:
                     if (f.get("size", 0) * fprog) > 8 * 1024 * 1024 or fprog > 0.01:
                         action = f'<a class="btn" href="/watch/{token}/{qname}">Play</a>'
                     else:
                         action = '<span class="mut">Preparing stream…</span>'
+                elif ext in REMUXABLE:
+                    action = '<span class="mut">Playable after download</span>'
                 rows2.append(f'<div class="row"><span class="name">{html.escape(fname)}</span><span class="size">{fsize} &middot; {fpct}%</span><span>{action}</span></div>{bar(fprog)}')
             if rows2:
                 files_section = '<div class="card"><h2>Files</h2>' + ''.join(rows2) + '<p class="mut">Playable files can be watched while they download.</p></div>'
@@ -524,6 +552,20 @@ def job_page(token: str):
         {files_section}"""
         return HTMLResponse(html_page(label, body, refresh=5))
 
+    if status == "queued":
+        conn = db()
+        ahead = conn.execute("SELECT COUNT(*) c FROM jobs WHERE status='queued' AND id<?", (row["id"],)).fetchone()["c"]
+        conn.close()
+        body = f"""
+        <div class="card center">
+          <h1>{name}</h1>
+          <span class="chip">In queue &middot; position {ahead + 1}</span>
+          <p>This download will start automatically when a slot is free. This page refreshes automatically.</p>
+          {bar(0.02)}
+          <p><a class="btn danger" href="/action/{token}/delete">Remove from queue</a></p>
+        </div>"""
+        return HTMLResponse(html_page("In queue", body, refresh=5))
+
     if status == "complete":
         return HTMLResponse(html_page(row["name"] or "Download", completed_body(row)))
 
@@ -538,7 +580,6 @@ def job_page(token: str):
 
     body = '<div class="card"><h1>Expired</h1><p>This download expired or was deleted.</p><p><a class="btn ghost" href="/">Home</a></p></div>'
     return HTMLResponse(html_page("Expired", body))
-
 
 @app.post("/start/{token}")
 def start_selected(token: str, ids: list[int] = Form(None)):
@@ -555,9 +596,16 @@ def start_selected(token: str, ids: list[int] = Form(None)):
     idset = {int(i) for i in ids}
     selected_size = sum(f.get("size", 0) for f in files if f.get("index") in idset)
     free = shutil.disk_usage(DOWNLOAD_DIR).free
-    if selected_size > free:
+    if selected_size > free - MIN_FREE_BYTES:
         body = f'<div class="card"><h1>Not enough storage</h1><p>Selected files need {human_size(selected_size)} but only {human_size(free)} is free. Delete old downloads first.</p><p><a class="btn ghost" href="/jobs">Manage downloads</a></p></div>'
         return HTMLResponse(html_page("Not enough storage", body), status_code=400)
+    set_job(token, selected_ids=",".join(str(i) for i in sorted(idset)))
+    conn = db()
+    active = conn.execute("SELECT COUNT(*) c FROM jobs WHERE status='downloading'").fetchone()["c"]
+    conn.close()
+    if active >= MAX_ACTIVE_DOWNLOADS:
+        set_job(token, status="queued")
+        return RedirectResponse(f"/job/{token}", status_code=303)
     for f in files:
         client.set_prio(row["torrent_hash"], f["index"], 0)
     for i in idset:
@@ -565,7 +613,6 @@ def start_selected(token: str, ids: list[int] = Form(None)):
     client.start(row["torrent_hash"])
     set_job(token, status="downloading")
     return RedirectResponse(f"/job/{token}", status_code=303)
-
 
 @app.get("/action/{token}/{action}")
 def job_action(token: str, action: str):
@@ -592,7 +639,6 @@ def job_action(token: str, action: str):
         return RedirectResponse("/jobs", status_code=303)
     raise HTTPException(status_code=404, detail="Unknown action")
 
-
 @app.get("/jobs", response_class=HTMLResponse)
 def jobs_page():
     conn = db()
@@ -616,14 +662,13 @@ def jobs_page():
     """
     return HTMLResponse(html_page("Downloads", body))
 
-
 # ----------------------------- completed files -----------------------------
 
 def completed_body(row):
     base = Path(row["save_path"])
     token = row["token"]
     files = sorted(
-        [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and "_zip_extract" not in x.parts],
+        [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and not x.name.endswith(".remuxing.mp4") and "_zip_extract" not in x.parts],
         key=lambda x: str(x).lower(),
     )
     if not files:
@@ -633,8 +678,11 @@ def completed_body(row):
         rel = f.relative_to(base)
         qrel = quote(str(rel))
         play = ""
-        if f.suffix.lower() in PLAYABLE:
+        ext = f.suffix.lower()
+        if ext in PLAYABLE:
             play = f'<a class="btn" href="/watch/{token}/{qrel}">Play</a>'
+        elif ext in REMUXABLE:
+            play = f'<a class="btn" href="/remux/{token}/{qrel}">Play</a>'
         items.append(
             f'<div class="row"><span class="name">{html.escape(str(rel))}</span><span class="size">{human_size(f.stat().st_size)}</span><span>{play} <a class="btn ghost" href="/file/{token}/{qrel}">Download</a></span></div>'
         )
@@ -652,14 +700,12 @@ def completed_body(row):
     {player}
     <div class="card">{''.join(items)}</div>"""
 
-
 @app.get("/files/{token}", response_class=HTMLResponse)
 def browse_files(token: str):
     row = get_job(token)
     if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
     return HTMLResponse(html_page(row["name"] or "Files", completed_body(row)))
-
 
 @app.get("/file/{token}/{rel_path:path}")
 def download_file(token: str, rel_path: str):
@@ -675,7 +721,6 @@ def download_file(token: str, rel_path: str):
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(target.name)}",
     }
     return Response(status_code=200, headers=headers)
-
 
 @app.get("/stream/{token}/{rel_path:path}")
 def stream_file(token: str, rel_path: str):
@@ -694,12 +739,21 @@ def stream_file(token: str, rel_path: str):
     }
     return Response(status_code=200, headers=headers)
 
-
 @app.get("/watch/{token}/{rel_path:path}", response_class=HTMLResponse)
 def watch_file(token: str, rel_path: str):
     row = get_job(token)
     if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    base = Path(row["save_path"])
+    track = ""
+    try:
+        video_path = safe_rel_path(base, rel_path)
+    except Exception:
+        video_path = None
+    if video_path and video_path.exists():
+        sub = find_subtitle(base, video_path)
+        if sub:
+            track = f'<track kind="subtitles" label="Subtitles" srclang="en" src="/subtitle/{token}/{quote(str(sub.relative_to(base)))}" default>'
     name = html.escape(Path(unquote(rel_path)).name)
     note = ""
     dl_btn = f'<a class="btn" href="/file/{token}/{rel_path}">Download file</a>'
@@ -709,12 +763,52 @@ def watch_file(token: str, rel_path: str):
     body = f"""
     <div class="card">
       <h1>{name}</h1>
-      <video controls preload="metadata" src="/stream/{token}/{rel_path}"></video>
+      <video controls preload="metadata" src="/stream/{token}/{rel_path}">{track}</video>
       {note}
       <p><a class="btn ghost" href="/job/{token}">Back</a> {dl_btn}</p>
     </div>"""
     return HTMLResponse(html_page(name, body))
 
+@app.get("/remux/{token}/{rel_path:path}", response_class=HTMLResponse)
+def remux_file(token: str, rel_path: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    base = Path(row["save_path"])
+    target = safe_rel_path(base, rel_path)
+    if not target.exists() or not target.is_file() or target.suffix.lower() not in REMUXABLE:
+        raise HTTPException(status_code=404, detail="File not found or not convertible")
+    out = target.with_suffix(".mp4")
+    if out.exists():
+        return RedirectResponse(f"/watch/{token}/{quote(str(out.relative_to(base)))}", status_code=303)
+    key = f"{token}:{rel_path}"
+    state = REMUX_JOBS.get(key)
+    if state and state.startswith("error"):
+        body = f'<div class="card"><h1>Conversion failed</h1><p>{html.escape(state[7:])}</p><p><a class="btn ghost" href="/job/{token}">Back</a></p></div>'
+        return HTMLResponse(html_page("Conversion failed", body))
+    if state != "running":
+        REMUX_JOBS[key] = "running"
+        threading.Thread(target=do_remux, args=(key, target, out), daemon=True).start()
+    body = f"""
+    <div class="card center">
+      <h1>Preparing browser playback</h1>
+      <p>Converting {html.escape(target.name)} to MP4 — video is copied, not re-encoded, so this is usually fast. The page refreshes automatically.</p>
+      {bar(0.5)}
+    </div>"""
+    return HTMLResponse(html_page("Converting", body, refresh=4))
+
+@app.get("/subtitle/{token}/{rel_path:path}")
+def subtitle_file(token: str, rel_path: str):
+    row = get_job(token)
+    if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    target = safe_rel_path(Path(row["save_path"]), rel_path)
+    if not target.exists() or not target.is_file() or target.suffix.lower() not in SUBTITLES:
+        raise HTTPException(status_code=404, detail="Subtitle not found")
+    raw = target.read_bytes()
+    if target.suffix.lower() == ".vtt":
+        return Response(content=raw, media_type="text/vtt")
+    return Response(content=srt_to_vtt(raw), media_type="text/vtt")
 
 @app.get("/zip/{token}")
 def download_zip(token: str):
@@ -737,13 +831,11 @@ def download_zip(token: str):
     }
     return Response(status_code=200, headers=headers)
 
-
 # ----------------------------- api -----------------------------
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/api/job/{token}")
 def job_api(token: str):
@@ -758,7 +850,6 @@ def job_api(token: str):
         "total_size": row["total_size"],
         "expires_at": row["expires_at"],
     }
-
 
 # ----------------------------- monitor -----------------------------
 
@@ -795,12 +886,23 @@ def monitor():
                     except Exception:
                         files = []
                     if files:
+                        usage = shutil.disk_usage(DOWNLOAD_DIR)
+                        if (t.get("total_size") or 0) > usage.total - MIN_FREE_BYTES:
+                            client.delete(t["hash"], True)
+                            shutil.rmtree(row["save_path"], ignore_errors=True)
+                            conn.execute("UPDATE jobs SET status='error', error=? WHERE id=?", ("This torrent is larger than the server's total storage.", row["id"]))
+                            continue
                         for f in files:
                             client.set_prio(t["hash"], f["index"], 0)
                         if len(files) == 1:
                             client.set_prio(t["hash"], files[0]["index"], 1)
-                            client.start(t["hash"])
-                            new_status = "downloading"
+                            active_now = conn.execute("SELECT COUNT(*) c FROM jobs WHERE status='downloading'").fetchone()["c"]
+                            if active_now >= MAX_ACTIVE_DOWNLOADS:
+                                conn.execute("UPDATE jobs SET selected_ids=? WHERE id=?", (str(files[0]["index"]), row["id"]))
+                                new_status = "queued"
+                            else:
+                                client.start(t["hash"])
+                                new_status = "downloading"
                         else:
                             new_status = "waiting_selection"
                         conn.execute(
@@ -819,6 +921,32 @@ def monitor():
                         "UPDATE jobs SET status=?, progress=?, torrent_hash=?, name=?, total_size=? WHERE id=?",
                         (new_status, prog, t["hash"], t.get("name"), t.get("total_size") or 0, row["id"]),
                     )
+            queued = conn.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id ASC").fetchall()
+            if queued:
+                active = conn.execute("SELECT COUNT(*) c FROM jobs WHERE status='downloading'").fetchone()["c"]
+                for q in queued:
+                    if active >= MAX_ACTIVE_DOWNLOADS:
+                        break
+                    if not q["torrent_hash"]:
+                        continue
+                    try:
+                        qfiles = client.files(q["torrent_hash"])
+                    except Exception:
+                        continue
+                    idset = {int(x) for x in (q["selected_ids"] or "").split(",") if x.strip()}
+                    if not idset:
+                        idset = {f.get("index") for f in qfiles}
+                    need = sum(f.get("size", 0) for f in qfiles if f.get("index") in idset)
+                    free_now = shutil.disk_usage(DOWNLOAD_DIR).free
+                    if need > free_now - MIN_FREE_BYTES:
+                        continue
+                    for f in qfiles:
+                        client.set_prio(q["torrent_hash"], f["index"], 0)
+                    for i in idset:
+                        client.set_prio(q["torrent_hash"], i, 1)
+                    client.start(q["torrent_hash"])
+                    conn.execute("UPDATE jobs SET status='downloading' WHERE id=?", (q["id"],))
+                    active += 1
             now = int(time.time())
             expired = conn.execute("SELECT * FROM jobs WHERE expires_at < ? AND status NOT IN ('expired','deleted')", (now,)).fetchall()
             for row in expired:
@@ -835,13 +963,11 @@ def monitor():
             print(f"monitor error: {e}", flush=True)
         time.sleep(4)
 
-
 def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     db()
     threading.Thread(target=monitor, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
 
 if __name__ == "__main__":
     main()
