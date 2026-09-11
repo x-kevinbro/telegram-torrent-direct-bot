@@ -1,4 +1,5 @@
 import html
+import json
 import os
 import re
 import secrets
@@ -23,6 +24,16 @@ QBIT_HOST = os.environ.get("QBIT_HOST", "http://qbittorrent:8080").rstrip("/")
 MAX_TORRENT_SIZE_GB = float(os.environ.get("MAX_TORRENT_SIZE_GB", "150"))
 MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", "2"))
 MIN_FREE_BYTES = int(float(os.environ.get("MIN_FREE_GB", "2")) * (1024 ** 3))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").strip()
+S3_REGION = os.environ.get("S3_REGION", "auto").strip()
+S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "").strip()
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "").strip()
+S3_PUBLIC_URL = os.environ.get("S3_PUBLIC_URL", "").rstrip("/")
+S3_AUTO_OFFLOAD = os.environ.get("S3_AUTO_OFFLOAD", "0") == "1"
+OFFLOAD_JOBS = {}
 LINK_EXPIRY_HOURS = int(os.environ.get("LINK_EXPIRY_HOURS", "24"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "/data/web.db")
@@ -59,12 +70,21 @@ def db():
         error TEXT,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        selected_ids TEXT
+        selected_ids TEXT,
+        link_password TEXT,
+        files_json TEXT,
+        offloaded INTEGER DEFAULT 0
     )
     """)
     existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    if "selected_ids" not in existing:
-        conn.execute("ALTER TABLE jobs ADD COLUMN selected_ids TEXT")
+    for col, ddl in {
+        "selected_ids": "ALTER TABLE jobs ADD COLUMN selected_ids TEXT",
+        "link_password": "ALTER TABLE jobs ADD COLUMN link_password TEXT",
+        "files_json": "ALTER TABLE jobs ADD COLUMN files_json TEXT",
+        "offloaded": "ALTER TABLE jobs ADD COLUMN offloaded INTEGER DEFAULT 0",
+    }.items():
+        if col not in existing:
+            conn.execute(ddl)
     conn.commit()
     return conn
 
@@ -252,6 +272,99 @@ def do_remux(key, src: Path, out: Path):
         REMUX_JOBS[key] = f"error: {e}"
         tmp.unlink(missing_ok=True)
 
+def notify(text):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        r = requests.post(f"https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
+        print(f"notify sent: {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"notify error: {e}", flush=True)
+
+def s3_enabled():
+    return bool(S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY and S3_PUBLIC_URL)
+
+def s3_client():
+    import boto3
+    return boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=S3_REGION,
+                        aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY)
+
+def job_local_files(base: Path):
+    return sorted(
+        [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip")
+         and not x.name.endswith(".remuxing.mp4") and "_zip_extract" not in x.parts],
+        key=lambda x: str(x).lower(),
+    )
+
+def job_manifest(row):
+    if row["offloaded"]:
+        try:
+            return json.loads(row["files_json"] or "[]")
+        except Exception:
+            return []
+    base = Path(row["save_path"])
+    return [{"rel": str(f.relative_to(base)), "size": f.stat().st_size} for f in job_local_files(base)]
+
+def manifest_key(row, rel_path):
+    rel_path = unquote(rel_path).lstrip("/")
+    try:
+        manifest = json.loads(row["files_json"] or "[]")
+    except Exception:
+        return None
+    for m in manifest:
+        if m["rel"] == rel_path:
+            return m["key"]
+    return None
+
+def do_offload(token):
+    try:
+        row = get_job(token)
+        if not row or row["offloaded"]:
+            OFFLOAD_JOBS[token] = "done"
+            return
+        base = Path(row["save_path"])
+        files = job_local_files(base)
+        client = s3_client()
+        manifest = []
+        for f in files:
+            rel = str(f.relative_to(base))
+            key = f"{token}/{rel}"
+            client.upload_file(str(f), S3_BUCKET, key)
+            manifest.append({"rel": rel, "size": f.stat().st_size, "key": key})
+        set_job(token, files_json=json.dumps(manifest), offloaded=1)
+        try:
+            if row["torrent_hash"]:
+                qbit().delete(row["torrent_hash"], False)
+        except Exception:
+            pass
+        shutil.rmtree(base, ignore_errors=True)
+        OFFLOAD_JOBS[token] = "done"
+        print(f"offload done: {token} ({len(manifest)} files)", flush=True)
+    except Exception as e:
+        OFFLOAD_JOBS[token] = f"error: {e}"
+        print(f"offload error: {e}", flush=True)
+
+def delete_s3_files(row):
+    if not row["offloaded"]:
+        return
+    try:
+        c = s3_client()
+        for m in json.loads(row["files_json"] or "[]"):
+            c.delete_object(Bucket=S3_BUCKET, Key=m["key"])
+    except Exception as e:
+        print(f"s3 cleanup error: {e}", flush=True)
+
+def link_denied(row, request: Request):
+    pw = row["link_password"]
+    if not pw:
+        return None
+    if request.query_params.get("key") == pw:
+        return None
+    if request.cookies.get(f"link_{row['token']}") == pw:
+        return None
+    return RedirectResponse(f"/gate/{row['token']}?next={quote(request.url.path)}", status_code=303)
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -274,7 +387,7 @@ a{color:var(--acc);text-decoration:none}
 h1{margin:0 0 6px;font-size:26px;overflow-wrap:anywhere}
 h2{margin:0 0 10px;font-size:18px}
 p{color:var(--mut);line-height:1.55}
-textarea,input[type=file],input[type=password]{width:100%;background:#0a1322;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:14px;font-size:15px}
+textarea,input{width:100%;background:#0a1322;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:14px;font-size:15px}
 textarea:focus,input:focus{outline:none;border-color:var(--acc)}
 .btn,button.btn{display:inline-block;background:linear-gradient(135deg,var(--acc),#0ea5b7);color:#04202a;font-weight:700;border:0;border-radius:12px;padding:12px 20px;font-size:15px;cursor:pointer;margin:6px 6px 6px 0}
 .btn:hover{filter:brightness(1.12)}
@@ -341,7 +454,7 @@ async def access_gate(request: Request, call_next):
     path = request.url.path
     # Share links authenticate via their unguessable token, so download managers
     # (no cookies) can fetch them. Everything else needs the site key cookie.
-    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/", "/remux/", "/subtitle/")
+    token_paths = ("/file/", "/stream/", "/zip/", "/files/", "/watch/", "/remux/", "/subtitle/", "/links/", "/gate/")
     if path in ("/health", "/unlock") or path.startswith(token_paths):
         return await call_next(request)
     if request.cookies.get("site_key") == SITE_KEY:
@@ -634,6 +747,7 @@ def job_action(token: str, action: str):
                 client.delete(row["torrent_hash"], True)
         except Exception:
             pass
+        delete_s3_files(row)
         shutil.rmtree(row["save_path"], ignore_errors=True)
         set_job(token, status="deleted")
         return RedirectResponse("/jobs", status_code=303)
@@ -665,53 +779,91 @@ def jobs_page():
 # ----------------------------- completed files -----------------------------
 
 def completed_body(row):
-    base = Path(row["save_path"])
     token = row["token"]
-    files = sorted(
-        [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and not x.name.endswith(".remuxing.mp4") and "_zip_extract" not in x.parts],
-        key=lambda x: str(x).lower(),
-    )
-    if not files:
+    offloaded = bool(row["offloaded"])
+    manifest = job_manifest(row)
+    if not manifest:
         return '<div class="card"><h1>No files found</h1><p>The download folder is empty.</p><p><a class="btn ghost" href="/">Home</a></p></div>'
     items = []
-    for f in files:
-        rel = f.relative_to(base)
-        qrel = quote(str(rel))
+    for m in manifest:
+        rel = m["rel"]
+        qrel = quote(rel)
         play = ""
-        ext = f.suffix.lower()
+        ext = Path(rel).suffix.lower()
         if ext in PLAYABLE:
             play = f'<a class="btn" href="/watch/{token}/{qrel}">Play</a>'
-        elif ext in REMUXABLE:
+        elif ext in REMUXABLE and not offloaded:
             play = f'<a class="btn" href="/remux/{token}/{qrel}">Play</a>'
         items.append(
-            f'<div class="row"><span class="name">{html.escape(str(rel))}</span><span class="size">{human_size(f.stat().st_size)}</span><span>{play} <a class="btn ghost" href="/file/{token}/{qrel}">Download</a></span></div>'
+            f'<div class="row"><span class="name">{html.escape(rel)}</span><span class="size">{human_size(m["size"])}</span><span>{play} <a class="btn ghost" href="/file/{token}/{qrel}">Download</a></span></div>'
         )
     title = html.escape(row["name"] or "Download")
     player = ""
-    if len(files) == 1 and files[0].suffix.lower() in PLAYABLE:
-        qrel = quote(str(files[0].relative_to(base)))
+    if len(manifest) == 1 and Path(manifest[0]["rel"]).suffix.lower() in PLAYABLE:
+        qrel = quote(manifest[0]["rel"])
         player = f'<div class="card"><video controls preload="metadata" src="/stream/{token}/{qrel}"></video></div>'
+    key_q = f"?key={quote(row['link_password'])}" if row["link_password"] else ""
+    all_links = "\n".join(f"{PUBLIC_BASE_URL}/file/{token}/{quote(m['rel'])}{key_q}" for m in manifest)
+    exp_hours_left = max(0, (row["expires_at"] - int(time.time())) // 3600)
+    cloud = '<span class="chip">&#9729; Stored in cloud storage</span>' if offloaded else ""
+    zip_btn = "" if offloaded else f'<a class="btn" href="/zip/{token}">Download all as ZIP</a>'
+    offload_note = ""
+    if s3_enabled() and not offloaded:
+        if OFFLOAD_JOBS.get(token) == "running":
+            offload_note = '<p class="mut">&#9729; Uploading to cloud storage… the page will keep working when it finishes.</p>'
+        else:
+            offload_note = f'<form method="post" action="/offload/{token}"><button class="btn ghost" type="submit">&#9729; Offload to cloud &amp; free local space</button></form>'
+    pw_state = "Password protected" if row["link_password"] else "No password"
     return f"""
     <div class="card">
       <h1>{title}</h1>
-      <span class="chip">Complete &middot; expires in {LINK_EXPIRY_HOURS}h</span>
-      <p><a class="btn" href="/zip/{token}">Download all as ZIP</a> <a class="btn danger" href="/action/{token}/delete">Delete files</a></p>
+      <span class="chip">Complete &middot; expires in ~{exp_hours_left}h</span> {cloud}
+      <p>{zip_btn} <a class="btn danger" href="/action/{token}/delete">Delete files</a></p>
+      {offload_note}
     </div>
     {player}
-    <div class="card">{''.join(items)}</div>"""
+    <div class="card">{''.join(items)}</div>
+    <div class="card">
+      <h2>Batch download</h2>
+      <p>Copy all links and paste them into IDM / aria2:</p>
+      <textarea readonly rows="6" onclick="this.select()">{html.escape(all_links)}</textarea>
+      <p><a class="btn ghost" href="/links/{token}">Download links.txt</a></p>
+    </div>
+    <div class="card">
+      <h2>Share controls</h2>
+      <p class="mut">{pw_state} &middot; links expire in ~{exp_hours_left}h</p>
+      <form method="post" action="/link-settings/{token}">
+        <p>Password for links (empty = no password):</p>
+        <input type="password" name="password" placeholder="optional password" autocomplete="off">
+        <p>Expire after (hours from now):</p>
+        <input type="number" name="expiry_hours" min="1" max="8760" placeholder="24">
+        <p><button class="btn" type="submit">Save</button></p>
+      </form>
+    </div>"""
 
 @app.get("/files/{token}", response_class=HTMLResponse)
-def browse_files(token: str):
+def browse_files(token: str, request: Request):
     row = get_job(token)
     if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
     return HTMLResponse(html_page(row["name"] or "Files", completed_body(row)))
 
 @app.get("/file/{token}/{rel_path:path}")
-def download_file(token: str, rel_path: str):
+def download_file(token: str, rel_path: str, request: Request):
     row = get_job(token)
     if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    if row["offloaded"]:
+        key = manifest_key(row, rel_path)
+        if not key:
+            raise HTTPException(status_code=404, detail="File not found")
+        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file() or target.name == "input.torrent":
         raise HTTPException(status_code=404, detail="File not found")
@@ -723,10 +875,18 @@ def download_file(token: str, rel_path: str):
     return Response(status_code=200, headers=headers)
 
 @app.get("/stream/{token}/{rel_path:path}")
-def stream_file(token: str, rel_path: str):
+def stream_file(token: str, rel_path: str, request: Request):
     row = get_job(token)
     if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    if row["offloaded"]:
+        key = manifest_key(row, rel_path)
+        if not key:
+            raise HTTPException(status_code=404, detail="File not found")
+        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -740,20 +900,34 @@ def stream_file(token: str, rel_path: str):
     return Response(status_code=200, headers=headers)
 
 @app.get("/watch/{token}/{rel_path:path}", response_class=HTMLResponse)
-def watch_file(token: str, rel_path: str):
+def watch_file(token: str, rel_path: str, request: Request):
     row = get_job(token)
     if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    key_q = ""
+    if request.query_params.get("key"):
+        key_q = "?key=" + quote(request.query_params.get("key"))
     base = Path(row["save_path"])
     track = ""
-    try:
-        video_path = safe_rel_path(base, rel_path)
-    except Exception:
-        video_path = None
-    if video_path and video_path.exists():
-        sub = find_subtitle(base, video_path)
-        if sub:
-            track = f'<track kind="subtitles" label="Subtitles" srclang="en" src="/subtitle/{token}/{quote(str(sub.relative_to(base)))}" default>'
+    if row["offloaded"]:
+        stem = Path(unquote(rel_path)).stem
+        for m in job_manifest(row):
+            mp = Path(m["rel"])
+            if mp.suffix.lower() in SUBTITLES and mp.stem.startswith(stem):
+                track = f'<track kind="subtitles" label="Subtitles" srclang="en" src="/subtitle/{token}/{quote(m["rel"])}{key_q}" default>'
+                break
+    else:
+        try:
+            video_path = safe_rel_path(base, rel_path)
+        except Exception:
+            video_path = None
+        if video_path and video_path.exists():
+            sub = find_subtitle(base, video_path)
+            if sub:
+                track = f'<track kind="subtitles" label="Subtitles" srclang="en" src="/subtitle/{token}/{quote(str(sub.relative_to(base)))}{key_q}" default>'
     name = html.escape(Path(unquote(rel_path)).name)
     note = ""
     dl_btn = f'<a class="btn" href="/file/{token}/{rel_path}">Download file</a>'
@@ -763,17 +937,22 @@ def watch_file(token: str, rel_path: str):
     body = f"""
     <div class="card">
       <h1>{name}</h1>
-      <video controls preload="metadata" src="/stream/{token}/{rel_path}">{track}</video>
+      <video controls preload="metadata" src="/stream/{token}/{rel_path}{key_q}">{track}</video>
       {note}
       <p><a class="btn ghost" href="/job/{token}">Back</a> {dl_btn}</p>
     </div>"""
     return HTMLResponse(html_page(name, body))
 
 @app.get("/remux/{token}/{rel_path:path}", response_class=HTMLResponse)
-def remux_file(token: str, rel_path: str):
+def remux_file(token: str, rel_path: str, request: Request):
     row = get_job(token)
     if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    if row["offloaded"]:
+        raise HTTPException(status_code=404, detail="Stored in cloud storage — remux unavailable")
     base = Path(row["save_path"])
     target = safe_rel_path(base, rel_path)
     if not target.exists() or not target.is_file() or target.suffix.lower() not in REMUXABLE:
@@ -798,10 +977,18 @@ def remux_file(token: str, rel_path: str):
     return HTMLResponse(html_page("Converting", body, refresh=4))
 
 @app.get("/subtitle/{token}/{rel_path:path}")
-def subtitle_file(token: str, rel_path: str):
+def subtitle_file(token: str, rel_path: str, request: Request):
     row = get_job(token)
     if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    if row["offloaded"]:
+        key = manifest_key(row, rel_path)
+        if not key:
+            raise HTTPException(status_code=404, detail="Subtitle not found")
+        return RedirectResponse(f"{S3_PUBLIC_URL}/{quote(key)}", status_code=302)
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file() or target.suffix.lower() not in SUBTITLES:
         raise HTTPException(status_code=404, detail="Subtitle not found")
@@ -811,10 +998,16 @@ def subtitle_file(token: str, rel_path: str):
     return Response(content=srt_to_vtt(raw), media_type="text/vtt")
 
 @app.get("/zip/{token}")
-def download_zip(token: str):
+def download_zip(token: str, request: Request):
     row = get_job(token)
     if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    if row["offloaded"]:
+        body = f'<div class="card"><h1>Stored in cloud storage</h1><p>Files are in cloud storage — download them individually below.</p><p><a class="btn ghost" href="/files/{token}">Back to files</a></p></div>'
+        return HTMLResponse(html_page("Cloud storage", body))
     base = Path(row["save_path"])
     files = [x for x in base.rglob("*") if x.is_file() and x.name != "input.torrent" and not x.name.endswith(".zip") and "_zip_extract" not in x.parts]
     if not files:
@@ -830,6 +1023,77 @@ def download_zip(token: str):
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote((row['name'] or token) + '.zip')}",
     }
     return Response(status_code=200, headers=headers)
+
+@app.get("/links/{token}")
+def links_txt(token: str, request: Request):
+    row = get_job(token)
+    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+        raise HTTPException(status_code=404, detail="Link not found or expired")
+    denied = link_denied(row, request)
+    if denied:
+        return denied
+    key_q = f"?key={quote(row['link_password'])}" if row["link_password"] else ""
+    lines = [f"{PUBLIC_BASE_URL}/file/{token}/{quote(m['rel'])}{key_q}" for m in job_manifest(row)]
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain",
+                    headers={"Content-Disposition": f"attachment; filename=links-{token}.txt"})
+
+@app.get("/gate/{token}", response_class=HTMLResponse)
+def gate_page(token: str, next: str = ""):
+    row = get_job(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    body = f"""
+    <div class="card" style="max-width:460px;margin:60px auto">
+      <h1>Password required</h1>
+      <p>This link is password protected.</p>
+      <form method="post" action="/gate/{token}">
+        <input type="hidden" name="next" value="{html.escape(next)}">
+        <input type="password" name="password" placeholder="Link password" autocomplete="off">
+        <p><button class="btn" type="submit">Open</button></p>
+      </form>
+    </div>"""
+    return HTMLResponse(html_page("Password required", body))
+
+@app.post("/gate/{token}")
+def gate_submit(token: str, password: str = Form(""), next: str = Form("")):
+    row = get_job(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if row["link_password"] and password == row["link_password"]:
+        target = next if next.startswith("/") else f"/files/{token}"
+        resp = RedirectResponse(target, status_code=303)
+        resp.set_cookie(f"link_{token}", password, max_age=7 * 24 * 3600, httponly=True, secure=True, samesite="lax")
+        return resp
+    return RedirectResponse(f"/gate/{token}", status_code=303)
+
+@app.post("/link-settings/{token}")
+def link_settings(token: str, password: str = Form(""), expiry_hours: str = Form("")):
+    row = get_job(token)
+    if not row or row["status"] != "complete":
+        raise HTTPException(status_code=404, detail="Job not found")
+    fields = {"link_password": password.strip() or None}
+    if expiry_hours.strip():
+        try:
+            h = int(expiry_hours)
+            fields["expires_at"] = int(time.time()) + max(1, min(h, 8760)) * 3600
+        except ValueError:
+            pass
+    set_job(token, **fields)
+    return RedirectResponse(f"/job/{token}", status_code=303)
+
+@app.post("/offload/{token}")
+def offload_now(token: str):
+    row = get_job(token)
+    if not row or row["status"] != "complete":
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not s3_enabled():
+        body = f'<div class="card"><h1>Cloud storage not configured</h1><p>Set S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY and S3_PUBLIC_URL in .env first.</p><p><a class="btn ghost" href="/job/{token}">Back</a></p></div>'
+        return HTMLResponse(html_page("Not configured", body), status_code=400)
+    if row["offloaded"] or OFFLOAD_JOBS.get(token) == "running":
+        return RedirectResponse(f"/job/{token}", status_code=303)
+    OFFLOAD_JOBS[token] = "running"
+    threading.Thread(target=do_offload, args=(token,), daemon=True).start()
+    return RedirectResponse(f"/job/{token}", status_code=303)
 
 # ----------------------------- api -----------------------------
 
@@ -917,6 +1181,11 @@ def monitor():
                             pass
                     prog = float(t.get("progress") or 0)
                     new_status = "complete" if prog >= 1 else row["status"]
+                    if new_status == "complete":
+                        notify(f"✅ Download complete: {t.get('name') or row['name'] or 'torrent'}\n{PUBLIC_BASE_URL}/files/{row['token']}")
+                        if S3_AUTO_OFFLOAD and s3_enabled() and OFFLOAD_JOBS.get(row["token"]) is None:
+                            OFFLOAD_JOBS[row["token"]] = "running"
+                            threading.Thread(target=do_offload, args=(row["token"],), daemon=True).start()
                     conn.execute(
                         "UPDATE jobs SET status=?, progress=?, torrent_hash=?, name=?, total_size=? WHERE id=?",
                         (new_status, prog, t["hash"], t.get("name"), t.get("total_size") or 0, row["id"]),
@@ -955,6 +1224,7 @@ def monitor():
                         client.delete(row["torrent_hash"], True)
                 except Exception:
                     pass
+                delete_s3_files(row)
                 shutil.rmtree(row["save_path"], ignore_errors=True)
                 conn.execute("UPDATE jobs SET status='expired' WHERE id=?", (row["id"],))
             conn.commit()
