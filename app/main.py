@@ -154,6 +154,14 @@ class QbitClient:
     def delete(self, torrent_hash, delete_files=True):
         return self._post("/api/v2/torrents/delete", data={"hashes": torrent_hash, "deleteFiles": str(delete_files).lower()})
 
+    def enable_streaming(self, t):
+        # Sequential piece order + first/last piece priority lets playback start
+        # long before the download finishes.
+        if not t.get("seq_dl"):
+            self._post("/api/v2/torrents/toggleSequentialDownload", data={"hashes": t["hash"]})
+        if not t.get("f_l_piece_prio"):
+            self._post("/api/v2/torrents/toggleFirstLastPiecePrio", data={"hash": t["hash"]})
+
 
 def qbit():
     return QbitClient()
@@ -472,6 +480,30 @@ def job_page(token: str):
             eta = human_eta(t.get("eta"))
             seeds = t.get("num_seeds", 0)
             peers = t.get("num_leechs", 0)
+        files_section = ""
+        if row["torrent_hash"]:
+            try:
+                tfiles = client.files(row["torrent_hash"])
+            except Exception:
+                tfiles = []
+            rows2 = []
+            for f in tfiles:
+                if int(f.get("priority", 0) or 0) == 0:
+                    continue
+                fname = f.get("name", "file")
+                fprog = float(f.get("progress") or 0)
+                fpct = int(fprog * 100)
+                fsize = human_size(f.get("size", 0))
+                qname = quote(fname)
+                action = ""
+                if Path(fname).suffix.lower() in PLAYABLE:
+                    if (f.get("size", 0) * fprog) > 8 * 1024 * 1024 or fprog > 0.01:
+                        action = f'<a class="btn" href="/watch/{token}/{qname}">Play</a>'
+                    else:
+                        action = '<span class="mut">Preparing stream…</span>'
+                rows2.append(f'<div class="row"><span class="name">{html.escape(fname)}</span><span class="size">{fsize} &middot; {fpct}%</span><span>{action}</span></div>{bar(fprog)}')
+            if rows2:
+                files_section = '<div class="card"><h2>Files</h2>' + ''.join(rows2) + '<p class="mut">Playable files can be watched while they download.</p></div>'
         label = "Paused" if status == "paused" else "Downloading"
         toggle = f'<a class="btn ghost" href="/action/{token}/resume">Resume</a>' if status == "paused" else f'<a class="btn ghost" href="/action/{token}/pause">Pause</a>'
         body = f"""
@@ -488,7 +520,8 @@ def job_page(token: str):
           </div>
           <p>{toggle} <a class="btn danger" href="/action/{token}/delete">Delete</a></p>
           <p class="mut">This page refreshes automatically every 5 seconds.</p>
-        </div>"""
+        </div>
+        {files_section}"""
         return HTMLResponse(html_page(label, body, refresh=5))
 
     if status == "complete":
@@ -647,7 +680,7 @@ def download_file(token: str, rel_path: str):
 @app.get("/stream/{token}/{rel_path:path}")
 def stream_file(token: str, rel_path: str):
     row = get_job(token)
-    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+    if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
     target = safe_rel_path(Path(row["save_path"]), rel_path)
     if not target.exists() or not target.is_file():
@@ -665,14 +698,20 @@ def stream_file(token: str, rel_path: str):
 @app.get("/watch/{token}/{rel_path:path}", response_class=HTMLResponse)
 def watch_file(token: str, rel_path: str):
     row = get_job(token)
-    if not row or row["status"] != "complete" or row["expires_at"] < int(time.time()):
+    if not row or row["status"] not in ("downloading", "paused", "complete") or row["expires_at"] < int(time.time()):
         raise HTTPException(status_code=404, detail="Link not found or expired")
     name = html.escape(Path(unquote(rel_path)).name)
+    note = ""
+    dl_btn = f'<a class="btn" href="/file/{token}/{rel_path}">Download file</a>'
+    if row["status"] != "complete":
+        note = '<p class="mut">Streaming while downloading — seeking past the downloaded part will buffer until it arrives.</p>'
+        dl_btn = ""
     body = f"""
     <div class="card">
       <h1>{name}</h1>
       <video controls preload="metadata" src="/stream/{token}/{rel_path}"></video>
-      <p><a class="btn ghost" href="/job/{token}">Back to files</a> <a class="btn" href="/file/{token}/{rel_path}">Download file</a></p>
+      {note}
+      <p><a class="btn ghost" href="/job/{token}">Back</a> {dl_btn}</p>
     </div>"""
     return HTMLResponse(html_page(name, body))
 
@@ -769,6 +808,11 @@ def monitor():
                             (new_status, t["hash"], t.get("name"), t.get("total_size") or 0, row["id"]),
                         )
                 elif row["status"] in ("downloading", "paused"):
+                    if row["status"] == "downloading":
+                        try:
+                            client.enable_streaming(t)
+                        except Exception:
+                            pass
                     prog = float(t.get("progress") or 0)
                     new_status = "complete" if prog >= 1 else row["status"]
                     conn.execute(

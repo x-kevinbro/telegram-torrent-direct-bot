@@ -50,7 +50,8 @@ Keeps your `.env`, downloads, database and qBittorrent config.
 - Paste a magnet link or upload a `.torrent` file
 - Metadata loads first — nothing downloads until you choose
 - Select only the files you want (skipped files stay at priority 0)
-- Live progress page with speed, ETA, seeds/peers
+- Live progress page with speed, ETA, seeds/peers and per-file progress
+- **Stream-on-the-fly**: watch video/audio while it is still downloading — pieces arrive in playback order (sequential download + first/last piece priority) and the player uses HTTP range requests
 - In-browser player for video/audio files
 - Direct download links per file, or download everything as a ZIP
 - Share links work in download managers (token-authenticated)
