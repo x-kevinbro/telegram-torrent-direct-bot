@@ -314,11 +314,37 @@ def s3_client(t=None):
     return boto3.client("s3", endpoint_url=t["endpoint"], region_name=t["region"],
                         aws_access_key_id=t["access"], aws_secret_access_key=t["secret"], config=cfg)
 
-def s3_target_for_size(size):
-    # Files up to S3_SPLIT_BYTES go to the primary (free-tier) target; bigger ones to the secondary.
-    if s3_target_ok(s3_target_b()) and size > S3_SPLIT_BYTES:
+def s3_bucket_used_bytes(t):
+    try:
+        c = s3_client(t)
+        total = 0
+        kwargs = {}
+        while True:
+            resp = c.list_objects_v2(Bucket=t["bucket"], **kwargs)
+            for obj in resp.get("Contents", []):
+                total += obj.get("Size", 0)
+            if not resp.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = resp.get("NextContinuationToken")
+        return total
+    except Exception as e:
+        print(f"bucket usage check error: {e}", flush=True)
+        return 0
+
+def s3_target_for_job(total_size):
+    # Route by TOTAL download size. Everything goes to the primary (free-tier)
+    # target unless the total exceeds S3_SPLIT_BYTES, or the primary bucket
+    # would overflow its free-tier capacity — then fall back to the secondary.
+    if not s3_target_ok(s3_target_b()):
+        return "a", s3_target_a()
+    if total_size > S3_SPLIT_BYTES:
         return "b", s3_target_b()
-    return "a", s3_target_a()
+    a = s3_target_a()
+    used = s3_bucket_used_bytes(a)
+    if used + total_size > S3_SPLIT_BYTES:
+        print(f"primary bucket nearly full ({used} used), falling back to secondary", flush=True)
+        return "b", s3_target_b()
+    return "a", a
 
 def job_local_files(base: Path):
     return sorted(
@@ -359,19 +385,15 @@ def do_offload(token):
             return
         base = Path(row["save_path"])
         files = job_local_files(base)
-        clients = {}
-        buckets = {}
+        total = sum(f.stat().st_size for f in files)
+        store, t = s3_target_for_job(total)
+        client = s3_client(t)
         manifest = []
         for f in files:
             rel = str(f.relative_to(base))
-            size = f.stat().st_size
-            store, t = s3_target_for_size(size)
-            if store not in clients:
-                clients[store] = s3_client(t)
-                buckets[store] = t["bucket"]
             key = f"{token}/{rel}"
-            clients[store].upload_file(str(f), buckets[store], key)
-            manifest.append({"rel": rel, "size": size, "key": key, "store": store})
+            client.upload_file(str(f), t["bucket"], key)
+            manifest.append({"rel": rel, "size": f.stat().st_size, "key": key, "store": store})
         set_job(token, files_json=json.dumps(manifest), offloaded=1)
         try:
             if row["torrent_hash"]:
@@ -380,7 +402,7 @@ def do_offload(token):
             pass
         shutil.rmtree(base, ignore_errors=True)
         OFFLOAD_JOBS[token] = "done"
-        print(f"offload done: {token} ({len(manifest)} files)", flush=True)
+        print(f"offload done: {token} ({len(manifest)} files, {total} bytes -> {store})", flush=True)
     except Exception as e:
         OFFLOAD_JOBS[token] = f"error: {e}"
         print(f"offload error: {e}", flush=True)
