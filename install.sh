@@ -67,12 +67,12 @@ log "Installing packages..."
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq || true
-  apt-get install -y curl tar gzip ca-certificates || true
+  apt-get install -y curl tar gzip xz-utils ca-certificates || true
   command -v docker >/dev/null 2>&1 || apt-get install -y docker.io || true
   docker compose version >/dev/null 2>&1 || apt-get install -y docker-compose-v2 2>/dev/null || apt-get install -y docker-compose-plugin 2>/dev/null || true
   [ -n "$DOMAIN" ] && { command -v certbot >/dev/null 2>&1 || apt-get install -y certbot; }
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y curl tar gzip ca-certificates || true
+  dnf install -y curl tar gzip xz ca-certificates || true
   command -v docker >/dev/null 2>&1 || dnf install -y docker || true
   docker compose version >/dev/null 2>&1 || dnf install -y docker-compose-plugin 2>/dev/null || dnf install -y docker-compose 2>/dev/null || true
   [ -n "$DOMAIN" ] && { command -v certbot >/dev/null 2>&1 || dnf install -y certbot; }
@@ -119,6 +119,27 @@ Downloads\TempPath=/downloads/incomplete/
 Session\DefaultSavePath=/downloads/
 Session\TempPath=/downloads/incomplete/
 EOF
+fi
+
+# static ffmpeg (lightweight, no apt bloat) for MKV->MP4 browser playback
+mkdir -p "$DIR/ffmpeg-bin"
+if [ ! -x "$DIR/ffmpeg-bin/ffmpeg" ]; then
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64)        FFURL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" ;;
+    aarch64|arm64) FFURL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" ;;
+    *)             FFURL="" ;;
+  esac
+  if [ -n "$FFURL" ]; then
+    log "Downloading static ffmpeg..."
+    if curl -fsSL "$FFURL" -o "$DIR/.ffmpeg.tar.xz" && tar xJf "$DIR/.ffmpeg.tar.xz" -C "$DIR"; then
+      cp "$DIR"/ffmpeg-*-static/ffmpeg "$DIR/ffmpeg-bin/ffmpeg"
+      chmod +x "$DIR/ffmpeg-bin/ffmpeg"
+    else
+      warn "ffmpeg download failed — MKV-to-MP4 conversion will be unavailable"
+    fi
+    rm -rf "$DIR"/ffmpeg-*-static "$DIR/.ffmpeg.tar.xz"
+  fi
 fi
 
 # timezone in compose
@@ -220,9 +241,20 @@ SITE_NAME=$SITE_NAME
 SITE_KEY=$SITE_KEY
 QBIT_HOST=http://qbittorrent:8080
 MAX_TORRENT_SIZE_GB=$MAX_GB
+MAX_ACTIVE_DOWNLOADS=2
+MIN_FREE_GB=2
 LINK_EXPIRY_HOURS=$EXPIRY_H
 DOWNLOAD_DIR=/downloads
 DATABASE_PATH=/data/web.db
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+S3_ENDPOINT=
+S3_REGION=auto
+S3_BUCKET=
+S3_ACCESS_KEY=
+S3_SECRET_KEY=
+S3_PUBLIC_URL=
+S3_AUTO_OFFLOAD=0
 EOF
 chmod 600 "$DIR/.env"
 
