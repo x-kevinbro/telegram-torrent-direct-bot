@@ -54,11 +54,15 @@ Keeps your `.env`, downloads, database and qBittorrent config. App code is mount
 - **Stream-on-the-fly**: watch video/audio while it is still downloading (sequential download + first/last piece priority + HTTP range streaming)
 - **MKV/AVI → MP4 one-click conversion** for browser playback (static FFmpeg, video copied — no re-encode)
 - **Subtitle auto-load**: a `.srt`/`.vtt` next to a video shows up in the player (SRT converted to WebVTT)
+- **Completion notifications**: Telegram message when a download finishes (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`)
+- **Batch download**: copy-all-links box plus a downloadable `links.txt` for IDM/aria2
+- **S3/R2 cloud offload**: optionally auto-upload completed files to S3-compatible storage, delete the local copies, and keep serving links via redirect (`S3_*` settings). Manual "Offload to cloud" button per download too.
+- **Share controls per link**: optional password gate and custom expiry hours
 - **Download queue**: `MAX_ACTIVE_DOWNLOADS` slots; extra downloads wait in queue with a position and auto-start
 - **Disk guard**: rejects torrents that cannot fit — at metadata time and at start time — keeping a `MIN_FREE_GB` safety buffer
 - In-browser player, direct per-file links, and download-all-as-ZIP
 - Share links work in download managers (token-authenticated, resumable/range support)
-- Automatic expiry and cleanup
+- Automatic expiry and cleanup (also cleans cloud objects)
 - Access-key gate keeps the site private
 
 ## Stack
@@ -68,6 +72,7 @@ Keeps your `.env`, downloads, database and qBittorrent config. App code is mount
 - Nginx for HTTPS + efficient file serving (X-Accel-Redirect)
 - SQLite for job tracking
 - Static FFmpeg binary for MKV→MP4 remuxing
+- boto3 for S3-compatible cloud offload
 
 ## Manual deploy
 
@@ -79,4 +84,4 @@ docker compose up -d --build
 
 ## Environment
 
-See `.env.example`. `SITE_KEY` protects the site with an access key when set. `MAX_ACTIVE_DOWNLOADS` and `MIN_FREE_GB` control the queue and disk guard.
+See `.env.example`. `SITE_KEY` protects the site with an access key when set. `MAX_ACTIVE_DOWNLOADS` and `MIN_FREE_GB` control the queue and disk guard. Telegram and S3/R2 settings are optional and dormant when empty.
